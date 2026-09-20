@@ -70,6 +70,12 @@ type Config struct {
 	// loop and from recovery, so it must not block or call back into the
 	// engine. Nil disables event reporting.
 	OnEvent func(Event)
+
+	// OnTrace receives the phase breakdown of each completed operation. It is
+	// called from the goroutine that issued the operation and must not block
+	// or call back into the engine. Nil disables tracing entirely, and the
+	// engine then does no timing work at all.
+	OnTrace func(Trace)
 }
 
 func (c Config) withDefaults() Config {

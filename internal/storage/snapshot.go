@@ -245,7 +245,7 @@ func decodeSnapshot(buf []byte, cfg Config) (*stateMachine, error) {
 //
 // Compaction is deliberately not done here. Only the event loop may delete
 // segments, and only after this function has returned successfully.
-func publishSnapshot(dir string, snap *stateMachine, cfg Config, hooks *ioHooks) (path string, ambiguous bool, err error) {
+func publishSnapshot(dir string, snap *stateMachine, cfg Config, hooks *ioHooks, tr *traceRecorder) (path string, ambiguous bool, err error) {
 	const op = "publishSnapshot"
 
 	seq := snap.applied
@@ -268,6 +268,8 @@ func publishSnapshot(dir string, snap *stateMachine, cfg Config, hooks *ioHooks)
 		f.Close()
 		return "", false, wrapError(CodeStorage, op, "write temporary snapshot", err)
 	}
+	tr.markBytes(SpanSnapshotWrite, int64(len(encoded)))
+
 	if err := hooks.Sync(f); err != nil {
 		f.Close()
 		return "", false, wrapError(CodeStorage, op, "sync temporary snapshot", err)
@@ -275,6 +277,7 @@ func publishSnapshot(dir string, snap *stateMachine, cfg Config, hooks *ioHooks)
 	if err := f.Close(); err != nil {
 		return "", false, wrapError(CodeStorage, op, "close temporary snapshot", err)
 	}
+	tr.mark(SpanSnapshotFileSync)
 
 	// Validate what actually reached the disk, not the buffer we still hold.
 	readBack, err := os.ReadFile(tmpPath)
@@ -288,13 +291,18 @@ func publishSnapshot(dir string, snap *stateMachine, cfg Config, hooks *ioHooks)
 	if decoded.applied != seq || decoded.digest() != snap.digest() {
 		return "", false, errorf(CodeCorruption, op, "temporary snapshot does not round trip at sequence %d", seq)
 	}
+	tr.mark(SpanSnapshotValidate)
 
 	if err := hooks.Rename(tmpPath, finalPath); err != nil {
 		return "", true, wrapError(CodeStorage, op, "rename snapshot into place", err)
 	}
+	tr.mark(SpanSnapshotRename)
+
 	if err := hooks.SyncDir(dir); err != nil {
 		return "", true, wrapError(CodeStorage, op, "sync directory after snapshot rename", err)
 	}
+	tr.mark(SpanSnapshotDirSync)
+
 	return finalPath, false, nil
 }
 

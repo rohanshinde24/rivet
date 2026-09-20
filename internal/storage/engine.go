@@ -70,6 +70,7 @@ const (
 type request struct {
 	kind  reqKind
 	ctx   context.Context
+	trace *traceRecorder
 	key   []byte
 	value []byte
 	id    RequestIdentity
@@ -114,10 +115,11 @@ const (
 // Exported methods only validate arguments, copy caller bytes, and hand a
 // request to that loop.
 type Engine struct {
-	cfg   Config
-	hooks *ioHooks
-	phase phaseHook
-	lock  *dirLock
+	cfg     Config
+	hooks   *ioHooks
+	phase   phaseHook
+	lock    *dirLock
+	tracing bool
 
 	reqCh        chan *request
 	snapshotDone chan snapshotOutcome
@@ -136,6 +138,7 @@ type Engine struct {
 	scratch        []byte
 	snapshotActive bool
 	snapshotReply  chan response
+	snapshotTrace  *traceRecorder
 	snapshotSeq    uint64
 
 	// Mirrored for Stats, which must work when the loop is gone.
@@ -185,6 +188,7 @@ func openEngine(cfg Config, hooks *ioHooks, phase phaseHook) (*Engine, error) {
 		hooks:        hooks,
 		phase:        phase,
 		lock:         lock,
+		tracing:      cfg.OnTrace != nil,
 		reqCh:        make(chan *request, cfg.QueueCapacity),
 		snapshotDone: make(chan snapshotOutcome, 1),
 		loopDone:     make(chan struct{}),
@@ -266,13 +270,19 @@ func (e *Engine) Stats() Stats {
 // The read is ordered at the event loop between commands, which is its
 // linearization point. It appends nothing to the WAL.
 func (e *Engine) Get(ctx context.Context, key []byte) (value []byte, found bool, appliedSeq uint64, err error) {
+	tr := e.newTrace(ctx, TraceOpGet)
 	if err := e.validateKey("Get", key); err != nil {
+		e.emitAbandonedTrace(tr, CodeOf(err))
 		return nil, false, 0, err
 	}
-	resp, err := e.submit(ctx, &request{kind: reqGet, key: append([]byte(nil), key...)})
+	tr.mark(SpanValidate)
+
+	resp, err := e.submit(ctx, &request{kind: reqGet, trace: tr, key: append([]byte(nil), key...)})
 	if err != nil {
+		e.emitAbandonedTrace(tr, CodeOf(err))
 		return nil, false, 0, err
 	}
+	e.emitTrace(tr, resp.result.AppliedSequence, CodeOf(resp.err))
 	return resp.value, resp.found, resp.result.AppliedSequence, resp.err
 }
 
@@ -282,41 +292,61 @@ func (e *Engine) Get(ctx context.Context, key []byte) (value []byte, found bool,
 // error returned after the append began leaves the outcome unknown: the caller
 // keeps the same request identity and retries.
 func (e *Engine) Put(ctx context.Context, id RequestIdentity, key, value []byte) (writeResult, error) {
-	if err := e.validateKey("Put", key); err != nil {
+	tr := e.newTrace(ctx, TraceOpPut)
+	fail := func(err error) (writeResult, error) {
+		e.emitAbandonedTrace(tr, CodeOf(err))
 		return writeResult{}, err
+	}
+
+	if err := e.validateKey("Put", key); err != nil {
+		return fail(err)
 	}
 	if len(value) > e.cfg.MaxValueBytes {
-		return writeResult{}, errorf(CodeInvalidArgument, "Put",
-			"value is %d bytes, above the limit %d", len(value), e.cfg.MaxValueBytes)
+		return fail(errorf(CodeInvalidArgument, "Put",
+			"value is %d bytes, above the limit %d", len(value), e.cfg.MaxValueBytes))
 	}
 	if err := e.validateIdentity("Put", id); err != nil {
-		return writeResult{}, err
+		return fail(err)
 	}
+	tr.mark(SpanValidate)
+
 	resp, err := e.submit(ctx, &request{
 		kind:  reqPut,
 		id:    id,
+		trace: tr,
 		key:   append([]byte(nil), key...),
 		value: append([]byte(nil), value...),
 	})
 	if err != nil {
-		return writeResult{}, err
+		return fail(err)
 	}
+	e.emitTrace(tr, resp.result.AppliedSequence, CodeOf(resp.err))
 	return resp.result, resp.err
 }
 
 // Delete removes key. Deleting an absent key succeeds with Existed false; both
 // outcomes are durable commands so a retry returns the original result.
 func (e *Engine) Delete(ctx context.Context, id RequestIdentity, key []byte) (writeResult, error) {
-	if err := e.validateKey("Delete", key); err != nil {
+	tr := e.newTrace(ctx, TraceOpDelete)
+	fail := func(err error) (writeResult, error) {
+		e.emitAbandonedTrace(tr, CodeOf(err))
 		return writeResult{}, err
+	}
+
+	if err := e.validateKey("Delete", key); err != nil {
+		return fail(err)
 	}
 	if err := e.validateIdentity("Delete", id); err != nil {
-		return writeResult{}, err
+		return fail(err)
 	}
-	resp, err := e.submit(ctx, &request{kind: reqDelete, id: id, key: append([]byte(nil), key...)})
+	tr.mark(SpanValidate)
+
+	resp, err := e.submit(ctx, &request{kind: reqDelete, id: id, trace: tr,
+		key: append([]byte(nil), key...)})
 	if err != nil {
-		return writeResult{}, err
+		return fail(err)
 	}
+	e.emitTrace(tr, resp.result.AppliedSequence, CodeOf(resp.err))
 	return resp.result, resp.err
 }
 
@@ -324,10 +354,13 @@ func (e *Engine) Delete(ctx context.Context, id RequestIdentity, key []byte) (wr
 // compacts the segments it covers. It returns when publication and compaction
 // have finished.
 func (e *Engine) CreateSnapshot(ctx context.Context) (sequence uint64, path string, err error) {
-	resp, err := e.submit(ctx, &request{kind: reqSnapshot})
+	tr := e.newTrace(ctx, TraceOpSnapshot)
+	resp, err := e.submit(ctx, &request{kind: reqSnapshot, trace: tr})
 	if err != nil {
+		e.emitAbandonedTrace(tr, CodeOf(err))
 		return 0, "", err
 	}
+	e.emitTrace(tr, resp.result.AppliedSequence, CodeOf(resp.err))
 	if resp.err != nil {
 		return 0, "", resp.err
 	}
@@ -421,28 +454,39 @@ func (e *Engine) run() {
 	}
 }
 
+// sendReply closes the respond span and hands the result to the caller. The
+// channel send is the happens-before edge that publishes the spans, so the
+// event loop must not touch the recorder after this returns.
+func sendReply(r *request, resp response) {
+	r.trace.mark(SpanRespond)
+	r.reply <- resp
+}
+
 func (e *Engine) handle(r *request) {
+	r.trace.mark(SpanQueueWait)
+
 	// Requests queued before Close are resolved as definitely not executed.
 	switch e.state.Load() {
 	case stateFaulted:
-		r.reply <- response{err: newError(CodeFaulted, "handle", "engine is faulted")}
+		sendReply(r, response{err: newError(CodeFaulted, "handle", "engine is faulted")})
 		return
 	case stateClosing, stateClosed:
-		r.reply <- response{err: newError(CodeClosed, "handle", "engine closed before this request ran")}
+		sendReply(r, response{err: newError(CodeClosed, "handle", "engine closed before this request ran")})
 		return
 	}
 	if err := r.ctx.Err(); err != nil {
-		r.reply <- response{err: wrapError(CodeCanceled, "handle",
-			"caller context ended before processing", err)}
+		sendReply(r, response{err: wrapError(CodeCanceled, "handle",
+			"caller context ended before processing", err)})
 		return
 	}
 
 	switch r.kind {
 	case reqGet:
 		value, found := e.sm.get(r.key)
+		r.trace.mark(SpanRead)
 		e.gets.Add(1)
-		r.reply <- response{value: value, found: found,
-			result: writeResult{AppliedSequence: e.sm.applied}}
+		sendReply(r, response{value: value, found: found,
+			result: writeResult{AppliedSequence: e.sm.applied}})
 	case reqPut:
 		e.handleWrite(r, OpPut)
 	case reqDelete:
@@ -464,15 +508,16 @@ func (e *Engine) handleWrite(r *request, kind OpKind) {
 	}
 
 	decision, stored, err := e.sm.admit(cmd, e.cfg.MaxSessions)
+	r.trace.mark(SpanAdmit)
 	if err != nil {
 		e.cfg.emit(Event{Name: EventSessionRejected, Code: CodeOf(err), Detail: err.Error()})
-		r.reply <- response{err: err}
+		sendReply(r, response{err: err})
 		return
 	}
 	if decision == admitDuplicate {
 		e.dupHits.Add(1)
 		e.cfg.emit(Event{Name: EventDedupHit, Sequence: stored.AppliedSequence})
-		r.reply <- response{result: stored}
+		sendReply(r, response{result: stored})
 		return
 	}
 
@@ -480,50 +525,54 @@ func (e *Engine) handleWrite(r *request, kind OpKind) {
 	// appended, so the caller learns it definitely did not execute.
 	if kind == OpPut {
 		if _, exists := e.sm.kv[string(cmd.Key)]; !exists && len(e.sm.kv) >= e.cfg.MaxKeys {
-			r.reply <- response{err: errorf(CodeResourceExhausted, "handleWrite",
-				"key count is at the configured maximum %d", e.cfg.MaxKeys)}
+			sendReply(r, response{err: errorf(CodeResourceExhausted, "handleWrite",
+				"key count is at the configured maximum %d", e.cfg.MaxKeys)})
 			return
 		}
 	}
 
 	seq := e.sm.applied + 1
 	payload := cmd.encode(nil)
+	r.trace.mark(SpanEncode)
 
 	if err := e.runPhase(phaseBeforeAppend); err != nil {
-		r.reply <- response{err: wrapError(CodeStorage, "append", "failpoint before append", err)}
+		sendReply(r, response{err: wrapError(CodeStorage, "append", "failpoint before append", err)})
 		return
 	}
 
 	frame, err := e.wal.appendRecord(seq, payload, e.scratch)
+	r.trace.markBytes(SpanAppend, int64(len(frame)))
 	e.scratch = frame[:0]
 	if err != nil {
 		// Part of a frame may be on disk. Only recovery, which can see whether
 		// it is the physical tail, may decide what it means.
 		e.fault("append", err)
-		r.reply <- response{err: wrapError(CodeStorage, "append",
-			"append failed; outcome unknown", err)}
+		sendReply(r, response{err: wrapError(CodeStorage, "append",
+			"append failed; outcome unknown", err)})
 		return
 	}
 	if err := e.runPhase(phaseAfterWrite); err != nil {
 		e.fault("append", err)
-		r.reply <- response{err: wrapError(CodeStorage, "append", "failpoint after write", err)}
+		sendReply(r, response{err: wrapError(CodeStorage, "append", "failpoint after write", err)})
 		return
 	}
 
 	if err := e.runPhase(phaseBeforeSync); err != nil {
 		e.fault("sync", err)
-		r.reply <- response{err: wrapError(CodeStorage, "sync", "failpoint before sync", err)}
+		sendReply(r, response{err: wrapError(CodeStorage, "sync", "failpoint before sync", err)})
 		return
 	}
-	if err := e.wal.sync(); err != nil {
+	err = e.wal.sync()
+	r.trace.mark(SpanSync)
+	if err != nil {
 		e.fault("sync", err)
-		r.reply <- response{err: wrapError(CodeStorage, "sync",
-			"sync failed; durability unknown", err)}
+		sendReply(r, response{err: wrapError(CodeStorage, "sync",
+			"sync failed; durability unknown", err)})
 		return
 	}
 	if err := e.runPhase(phaseAfterSync); err != nil {
 		e.fault("sync", err)
-		r.reply <- response{err: wrapError(CodeStorage, "sync", "failpoint after sync", err)}
+		sendReply(r, response{err: wrapError(CodeStorage, "sync", "failpoint after sync", err)})
 		return
 	}
 
@@ -531,14 +580,15 @@ func (e *Engine) handleWrite(r *request, kind OpKind) {
 	// violation, not a rejected request.
 	if err := e.runPhase(phaseBeforeApply); err != nil {
 		e.fault("apply", err)
-		r.reply <- response{err: wrapError(CodeStorage, "apply", "failpoint before apply", err)}
+		sendReply(r, response{err: wrapError(CodeStorage, "apply", "failpoint before apply", err)})
 		return
 	}
 	res, err := e.sm.apply(cmd, seq, e.cfg.MaxKeys)
+	r.trace.mark(SpanApply)
 	if err != nil {
 		e.fault("apply", err)
-		r.reply <- response{err: wrapError(CodeCorruption, "apply",
-			"durable command could not be applied", err)}
+		sendReply(r, response{err: wrapError(CodeCorruption, "apply",
+			"durable command could not be applied", err)})
 		return
 	}
 	e.mirrorState()
@@ -549,24 +599,24 @@ func (e *Engine) handleWrite(r *request, kind OpKind) {
 	}
 	if err := e.runPhase(phaseAfterApply); err != nil {
 		e.fault("apply", err)
-		r.reply <- response{err: wrapError(CodeStorage, "apply", "failpoint after apply", err)}
+		sendReply(r, response{err: wrapError(CodeStorage, "apply", "failpoint after apply", err)})
 		return
 	}
 
 	if err := e.maybeRotate(); err != nil {
 		// The write itself succeeded and is durable, but the next append
 		// target is uncertain, so the engine stops serving after answering.
-		r.reply <- response{result: res}
+		sendReply(r, response{result: res})
 		e.fault("rotate", err)
 		return
 	}
 
 	if err := e.runPhase(phaseBeforeReply); err != nil {
 		e.fault("reply", err)
-		r.reply <- response{err: wrapError(CodeStorage, "reply", "failpoint before reply", err)}
+		sendReply(r, response{err: wrapError(CodeStorage, "reply", "failpoint before reply", err)})
 		return
 	}
-	r.reply <- response{result: res}
+	sendReply(r, response{result: res})
 }
 
 // maybeRotate seals the active segment once it passes the configured size.
@@ -604,47 +654,52 @@ func (e *Engine) rotate() error {
 
 func (e *Engine) handleSnapshot(r *request) {
 	if e.snapshotActive {
-		r.reply <- response{err: newError(CodeSnapshotInProgress, "CreateSnapshot",
-			"another snapshot is already running")}
+		sendReply(r, response{err: newError(CodeSnapshotInProgress, "CreateSnapshot",
+			"another snapshot is already running")})
 		return
 	}
 	seq := e.sm.applied
 	if seq == e.snapshotSeq {
 		// Nothing has been applied since the last snapshot; publishing again
 		// would only rewrite identical bytes under a name that already exists.
-		r.reply <- response{
+		sendReply(r, response{
 			result:       writeResult{AppliedSequence: seq},
 			snapshotPath: filepath.Join(e.cfg.Dir, snapshotFinalName(seq)),
-		}
+		})
 		return
 	}
 
 	// The barrier runs on the event loop, so the captured copy and the
 	// segment boundary describe exactly the same sequence.
-	if err := e.rotate(); err != nil {
+	rotateErr := e.rotate()
+	r.trace.mark(SpanSnapshotRotate)
+	if err := rotateErr; err != nil {
 		e.fault("snapshot.rotate", err)
-		r.reply <- response{err: wrapError(CodeStorage, "CreateSnapshot",
-			"segment rotation failed at the snapshot barrier", err)}
+		sendReply(r, response{err: wrapError(CodeStorage, "CreateSnapshot",
+			"segment rotation failed at the snapshot barrier", err)})
 		return
 	}
 	snap := e.sm.clone()
+	r.trace.mark(SpanSnapshotCopy)
 
 	e.snapshotActive = true
 	e.snapActive.Store(true)
 	e.snapshotReply = r.reply
+	e.snapshotTrace = r.trace
 	e.cfg.emit(Event{Name: EventSnapshotStart, Sequence: seq, Count: int64(len(snap.kv))})
 
-	go func(snap *stateMachine, seq uint64) {
-		path, ambiguous, err := publishSnapshot(e.cfg.Dir, snap, e.cfg, e.hooks)
+	go func(snap *stateMachine, seq uint64, tr *traceRecorder) {
+		path, ambiguous, err := publishSnapshot(e.cfg.Dir, snap, e.cfg, e.hooks, tr)
 		e.snapshotDone <- snapshotOutcome{sequence: seq, path: path, ambiguous: ambiguous, err: err}
-	}(snap, seq)
+	}(snap, seq, r.trace)
 }
 
 func (e *Engine) completeSnapshot(out snapshotOutcome) {
 	e.snapshotActive = false
 	e.snapActive.Store(false)
 	reply := e.snapshotReply
-	e.snapshotReply = nil
+	trace := e.snapshotTrace
+	e.snapshotReply, e.snapshotTrace = nil, nil
 
 	if out.err != nil {
 		e.cfg.emit(Event{Name: EventSnapshotFailed, Sequence: out.sequence,
@@ -656,6 +711,7 @@ func (e *Engine) completeSnapshot(out snapshotOutcome) {
 			e.fault("snapshot.publish", out.err)
 		}
 		if reply != nil {
+			trace.mark(SpanRespond)
 			reply <- response{err: out.err}
 		}
 		return
@@ -668,8 +724,10 @@ func (e *Engine) completeSnapshot(out snapshotOutcome) {
 
 	// Only the owner compacts, and only after verified publication.
 	e.compact(out.sequence)
+	trace.mark(SpanCompaction)
 
 	if reply != nil {
+		trace.mark(SpanRespond)
 		reply <- response{
 			result:       writeResult{AppliedSequence: out.sequence},
 			snapshotPath: out.path,
