@@ -1,0 +1,64 @@
+# Tier 2: longer randomized work that does not belong on the pull-request path.
+#
+# A failure here is a real failure. Nothing in this file retries a failed
+# correctness run to turn it green, and any fuzz crasher is uploaded so the
+# input that produced it survives the run.
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repeat:
+    name: Repeated deterministic runs
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      # Repetition is what catches a test that passes on ordering luck.
+      - name: Ten consecutive runs
+        run: go test ./... -count=10 -timeout 35m
+
+      - name: Race detector, repeated
+        run: go test -race ./... -count=3 -timeout 35m
+
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - FuzzDecodeCommand
+          - FuzzDecodeFrame
+          - FuzzDecodeSnapshot
+          - FuzzRecoveryTruncation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Fuzz for ten minutes
+        run: go test ./internal/storage/ -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 10m
+
+      # A crasher is only useful if the input survives the runner.
+      - name: Upload crashers
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: internal/storage/testdata/fuzz/
+          if-no-files-found: ignore

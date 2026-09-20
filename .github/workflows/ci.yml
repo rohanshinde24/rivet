@@ -1,0 +1,99 @@
+# Tier 1: runs on every push to main and every pull request.
+#
+# Jobs exist only for targets that are actually built. A milestone that has not
+# landed is absent here rather than represented by a placeholder job that
+# passes because it checks nothing.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hygiene:
+    name: Source hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Module consistency
+        run: |
+          go mod tidy
+          if ! git diff --quiet -- go.mod go.sum 2>/dev/null; then
+            echo "go mod tidy changed the module files; commit the result."
+            git --no-pager diff -- go.mod go.sum
+            exit 1
+          fi
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: go build ./...
+
+  test:
+    # Both platforms run, because the durability boundary is a property of the
+    # sync primitive and the filesystem underneath it, not of the code. A pass
+    # on one operating system is not evidence for the other.
+    name: Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      # Covers the recovery matrix, the injected storage failures, the
+      # subprocess crash matrix, the randomized model comparison, and the
+      # seed corpus of every fuzz target.
+      - name: Unit, recovery and crash tests
+        run: go test ./... -timeout 15m
+
+  race:
+    name: Race detector
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: go test -race ./... -timeout 20m
