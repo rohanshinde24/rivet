@@ -44,6 +44,7 @@ func environmentManifest(dir string) []string {
 		"cpu:         " + cpuModel(),
 		"cpus:        " + fmt.Sprintf("%d logical, GOMAXPROCS=%d", runtime.NumCPU(), runtime.GOMAXPROCS(0)),
 		"filesystem:  " + filesystemOf(dir),
+		"load:        " + loadAverage() + " (a contended host makes a result incomparable to one taken on a quiet host)",
 		"sync policy: one file sync per write, then apply, then acknowledge",
 		"limits:      " + fmt.Sprintf("key<=%dB value<=%dB sessions=%d queue=%d segment=%dB",
 			cfg.MaxKeyBytes, cfg.MaxValueBytes, cfg.MaxSessions, cfg.QueueCapacity, cfg.SegmentTargetBytes),
@@ -66,6 +67,19 @@ func treeState() string {
 		return "unavailable"
 	}
 	return "dirty (results are not attributable to the revision above)"
+}
+
+// loadAverage reports the host run-queue length. Recovery timings on this
+// project were once attributed to the engine when the host was carrying three
+// times its core count, so the figure is recorded with every run.
+func loadAverage() string {
+	out := shellOutput("uptime")
+	if i := strings.Index(out, "load average"); i >= 0 {
+		if j := strings.Index(out[i:], ":"); j >= 0 {
+			return strings.TrimSpace(out[i+j+1:]) + fmt.Sprintf(" over %d cpus", runtime.NumCPU())
+		}
+	}
+	return "unavailable"
 }
 
 func cpuModel() string {
@@ -454,12 +468,23 @@ func BenchmarkRecovery(b *testing.B) {
 			}
 			bytesToReplay := walBytes(b, dir)
 
+			// One untimed recovery, so page cache state is the same for every
+			// measured round.
+			if warm, werr := Open(cfg); werr != nil {
+				b.Fatal(werr)
+			} else if werr := warm.Close(ctx); werr != nil {
+				b.Fatal(werr)
+			}
+
+			var lat latencies
 			b.ResetTimer()
 			for b.Loop() {
+				start := time.Now()
 				reopened, err := Open(cfg)
 				if err != nil {
 					b.Fatalf("reopen: %v", err)
 				}
+				lat.add(time.Since(start))
 				if got := reopened.Stats().ReplayedCommands; got != int64(records) {
 					b.Fatalf("replayed %d records, want %d", got, records)
 				}
@@ -469,7 +494,11 @@ func BenchmarkRecovery(b *testing.B) {
 			}
 			b.StopTimer()
 
-			// ResetTimer clears reported metrics, so both are reported here.
+			// ResetTimer clears reported metrics, so all of them are reported
+			// here. The percentiles matter more than the mean: the
+			// distribution is right-skewed, and a single slow sample from
+			// host contention moves the mean without moving p50.
+			lat.report(b)
 			b.ReportMetric(float64(records), "records")
 			b.ReportMetric(float64(bytesToReplay), "wal-bytes")
 		})
