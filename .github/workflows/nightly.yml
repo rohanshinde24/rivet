@@ -19,11 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           check-latest: true
+          cache: false
 
       # Repetition is what catches a test that passes on ordering luck.
       - name: Ten consecutive runs
@@ -45,11 +46,12 @@ jobs:
           - FuzzDecodeSnapshot
           - FuzzRecoveryTruncation
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           check-latest: true
+          cache: false
 
       - name: Fuzz for ten minutes
         run: go test ./internal/storage/ -run '^$' -fuzz '^${{ matrix.target }}$' -fuzztime 10m
@@ -57,7 +59,7 @@ jobs:
       # A crasher is only useful if the input survives the runner.
       - name: Upload crashers
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fuzz-corpus-${{ matrix.target }}
           path: internal/storage/testdata/fuzz/
