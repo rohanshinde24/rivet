@@ -1,0 +1,18 @@
+# Local design documents: specs, ADRs, and docs stay local until explicitly approved
+# for publication. Only the root README.md is tracked.
+*.md
+!/README.md
+
+# macOS
+.DS_Store
+
+# Go build and test output
+/bin/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Local engine data directories and generated evidence
+/data/
+/testdata/tmp/
