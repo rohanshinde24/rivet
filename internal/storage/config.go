@@ -3,8 +3,7 @@ package storage
 import "time"
 
 // Hard ceilings. Configured limits may only move downward from these values;
-// raising one is an on-disk and API migration, not a configuration change
-// (ADR-0007).
+// raising one is an on-disk and API migration, not a configuration change.
 const (
 	HardMaxKeyBytes      = 1024
 	HardMaxValueBytes    = 1 << 20 // 1 MiB
@@ -18,15 +17,15 @@ const (
 	HardMaxFramePayloadBytes = commandFixedBytes + 4 + HardMaxKeyBytes + HardMaxValueBytes
 )
 
-// Defaults proposed by SPEC-003 and its accepted ADRs. The values marked
-// "open question" in SPEC-003 are pinned here and listed in the P0.1 notes.
+// Default limits. Each is a deliberate choice rather than a tuned number:
+// changing one changes behavior a caller can observe.
 const (
 	DefaultMaxKeyBytes        = HardMaxKeyBytes
 	DefaultMaxValueBytes      = HardMaxValueBytes
-	DefaultMaxSessions        = 10_000 // SPEC-003 open question 1
-	DefaultQueueCapacity      = 1_024  // SPEC-003 open question 1
+	DefaultMaxSessions        = 10_000
+	DefaultQueueCapacity      = 1_024
 	DefaultMaxKeys            = 1_000_000
-	DefaultSegmentTargetBytes = 64 << 20 // SPEC-003 open question 6
+	DefaultSegmentTargetBytes = 64 << 20
 	DefaultCloseTimeout       = 30 * time.Second
 )
 
@@ -36,7 +35,7 @@ const (
 // and never change for the lifetime of the engine.
 type Config struct {
 	// Dir is the data directory. The engine takes exclusive ownership of it
-	// for its lifetime (INV-003-10).
+	// for its lifetime.
 	Dir string
 
 	// MaxKeyBytes bounds a key. Keys are non-empty.
@@ -46,16 +45,16 @@ type Config struct {
 	MaxValueBytes int
 
 	// MaxKeys bounds the number of live keys, and with the byte limits bounds
-	// snapshot size (INV-003-11).
+	// snapshot size.
 	MaxKeys int
 
 	// MaxSessions bounds the client session table. A new client beyond
 	// capacity is rejected before execution; sessions are not silently
-	// evicted in P0.1 (ADR-0006).
+	// evicted.
 	MaxSessions int
 
 	// QueueCapacity bounds the request queue feeding the event loop. A request
-	// that finds the queue full is rejected before execution (ADR-0005).
+	// that finds the queue full is rejected before execution.
 	QueueCapacity int
 
 	// SegmentTargetBytes is the size after which the active WAL segment is

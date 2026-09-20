@@ -125,7 +125,7 @@ func TestValidationRejectsBeforeExecution(t *testing.T) {
 
 func firstErr(_ writeResult, err error) error { return err }
 
-// --- INV-003-1, INV-003-2: acknowledged writes survive restart ---------
+// --- acknowledged writes survive restart -------------------------------
 
 func TestAcknowledgedWritesSurviveRestart(t *testing.T) {
 	dir := t.TempDir()
@@ -152,7 +152,7 @@ func TestAcknowledgedWritesSurviveRestart(t *testing.T) {
 	}
 }
 
-// --- INV-003-5: repeated recovery is deterministic ---------------------
+// --- repeated recovery is deterministic --------------------------------
 
 func TestRepeatedRecoveryIsIdentical(t *testing.T) {
 	dir := t.TempDir()
@@ -178,7 +178,7 @@ func TestRepeatedRecoveryIsIdentical(t *testing.T) {
 	}
 }
 
-// --- INV-003-8: duplicate suppression, live and across restart ---------
+// --- duplicate suppression, live and across restart --------------------
 
 func TestDuplicateRetry(t *testing.T) {
 	dir := t.TempDir()
@@ -220,7 +220,7 @@ func TestDuplicateRetry(t *testing.T) {
 	}
 }
 
-// --- INV-003-10: one writer per directory ------------------------------
+// --- one writer per directory ------------------------------------------
 
 func TestExclusiveDirectoryOwnership(t *testing.T) {
 	dir := t.TempDir()
@@ -233,7 +233,7 @@ func TestExclusiveDirectoryOwnership(t *testing.T) {
 	put(t, e, 1, 1, "k", "v") // the first engine is unaffected
 }
 
-// --- INV-003-4: tail damage versus interior corruption -----------------
+// --- tail damage versus interior corruption ----------------------------
 
 func activeSegmentPath(t *testing.T, dir string) string {
 	t.Helper()
@@ -326,7 +326,7 @@ func TestCorruptFinalRecordIsDropped(t *testing.T) {
 }
 
 // Damage before later data is interior corruption: the engine refuses to open
-// rather than skipping a record (INV-003-3).
+// rather than skipping a record.
 func TestInteriorCorruptionFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	e := open(t, dir, nil)
@@ -370,7 +370,7 @@ func TestCorruptSegmentHeaderFailsClosed(t *testing.T) {
 	}
 }
 
-// --- INV-003-6, INV-003-7: snapshots and safe compaction ---------------
+// --- snapshots and safe compaction -------------------------------------
 
 func TestSnapshotAndCompaction(t *testing.T) {
 	dir := t.TempDir()
@@ -458,7 +458,7 @@ func TestSnapshotWithoutNewCommandsIsIdempotent(t *testing.T) {
 }
 
 // A corrupt highest snapshot fails closed rather than silently falling back to
-// an older one whose WAL prefix may already be gone (ADR-0004).
+// an older one whose WAL prefix may already be gone.
 func TestCorruptHighestSnapshotFailsClosed(t *testing.T) {
 	dir := t.TempDir()
 	e := open(t, dir, nil)
@@ -506,7 +506,7 @@ func TestTemporarySnapshotIsIgnored(t *testing.T) {
 	}
 }
 
-// --- INV-003-12: ambiguous storage errors fault the engine -------------
+// --- ambiguous storage errors fault the engine -------------------------
 
 func TestSyncFailureFaultsEngine(t *testing.T) {
 	dir := t.TempDir()
@@ -591,7 +591,7 @@ func TestShortWriteFaultsAndRecovers(t *testing.T) {
 	}
 }
 
-// --- INV-003-11: bounded admission -------------------------------------
+// --- bounded admission -------------------------------------------------
 
 func TestQueueFullRejectsBeforeExecution(t *testing.T) {
 	dir := t.TempDir()

@@ -5,13 +5,13 @@ import (
 	"os"
 )
 
-// ioHooks indirects every storage operation whose failure SPEC-003 requires
-// tests to exercise: short writes, disk-full, sync, rename, truncate, and
+// ioHooks indirects every storage operation whose failure has to be
+// exercised by tests: short writes, disk-full, sync, rename, truncate, and
 // directory-sync errors.
 //
 // The type and its field are unexported and are only ever replaced from tests
 // in this package. No exported API, configuration key, or network surface can
-// reach it, which is the constraint SPEC-003 open question 5 asks for.
+// reach it, so a running system cannot trigger a failpoint.
 type ioHooks struct {
 	Write    func(f *os.File, b []byte) (int, error)
 	Sync     func(f *os.File) error
@@ -48,7 +48,7 @@ func syncDir(dir string) error {
 }
 
 // writeFull writes every byte of b, looping over partial writes. It never
-// assumes one Write call is complete (SPEC-003 "WAL record frame version 1").
+// assumes one Write call is complete.
 func (h *ioHooks) writeFull(f *os.File, b []byte) (int, error) {
 	written := 0
 	for len(b) > 0 {

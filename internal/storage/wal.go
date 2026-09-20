@@ -30,7 +30,7 @@ var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
 // errIncompleteFrame marks bytes that could be a torn write at the physical
 // end of the newest active segment. Recovery may truncate there, and only
-// there (ADR-0002). Any other decode failure is interior corruption.
+// there. Any other decode failure is interior corruption.
 var errIncompleteFrame = errors.New("incomplete frame")
 
 // encodeSegmentHeader returns the 32-byte header for a segment beginning at
@@ -98,8 +98,8 @@ func encodeFrame(dst []byte, seq uint64, payload []byte) []byte {
 //
 // It returns errIncompleteFrame when buf simply ends early, which the caller
 // distinguishes from corruption: only a torn tail may be truncated away. The
-// declared payload length is checked against maxPayload before any allocation
-// (INV-003-4, INV-003-11).
+// declared payload length is checked against maxPayload before any
+// allocation.
 func decodeFrame(buf []byte, maxPayload int) (seq uint64, payload []byte, size int, err error) {
 	const op = "decodeFrame"
 
@@ -220,7 +220,7 @@ func parseSegmentName(name string) (segmentName, error) {
 }
 
 // segmentWriter owns the single active WAL segment. Only the event loop uses
-// it (ADR-0005).
+// it.
 type segmentWriter struct {
 	dir      string
 	file     *os.File
@@ -312,6 +312,11 @@ func (w *segmentWriter) appendRecord(seq uint64, payload []byte, scratch []byte)
 }
 
 func (w *segmentWriter) sync() error {
+	if w.file == nil {
+		// The segment was sealed and handed off; there is nothing left open
+		// here to synchronize.
+		return nil
+	}
 	if err := w.hooks.Sync(w.file); err != nil {
 		return wrapError(CodeStorage, "sync", "sync active segment", err)
 	}
@@ -329,6 +334,8 @@ func (w *segmentWriter) seal() (string, error) {
 	if err := w.file.Close(); err != nil {
 		return "", wrapError(CodeStorage, op, "close before seal", err)
 	}
+	w.file = nil
+
 	sealed := filepath.Join(w.dir, sealedSegmentName(w.startSeq, w.lastSeq))
 	if err := w.hooks.Rename(w.path, sealed); err != nil {
 		return "", wrapError(CodeStorage, op, "rename to sealed name", err)

@@ -8,7 +8,7 @@ import (
 // Code is a bounded classification of every failure the engine can report.
 // Codes are part of the engine contract: callers branch on them to decide
 // whether an operation definitely did not execute, definitely executed, or
-// has an unknown outcome (SPEC-003 "Write acknowledgement").
+// has an unknown outcome.
 type Code uint8
 
 const (
@@ -44,14 +44,14 @@ const (
 	CodeSnapshotInProgress
 
 	// CodeFaulted marks a request refused because an earlier ambiguous storage
-	// error moved the engine to Faulted (INV-003-12).
+	// error moved the engine to Faulted.
 	CodeFaulted
 
 	// CodeClosed marks a request refused because the engine is closing or closed.
 	CodeClosed
 
 	// CodeCorruption marks durable state that cannot be proven to be a valid
-	// recovery prefix. Recovery fails closed (INV-003-3, INV-003-4).
+	// recovery prefix. Recovery fails closed.
 	CodeCorruption
 
 	// CodeStorage marks an I/O error. When it can make the active recovery path
@@ -60,7 +60,7 @@ const (
 	CodeStorage
 
 	// CodeLocked marks a data directory already owned by another engine
-	// instance (INV-003-10).
+	// instance.
 	CodeLocked
 )
 
@@ -96,7 +96,7 @@ func (c Code) String() string {
 }
 
 // Error is the engine's error type. Detail never contains raw key or value
-// bytes (SPEC-003 "Observability").
+// bytes.
 type Error struct {
 	Code   Code
 	Op     string

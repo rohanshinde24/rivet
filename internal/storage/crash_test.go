@@ -23,7 +23,7 @@ const crashDurableWrites = 5
 //
 // In-process error injection cannot cover this: only a killed process loses
 // applied state that was never synchronized, which is exactly the boundary
-// INV-003-1 and INV-003-2 describe.
+// between a write that is durable and one that is not.
 func TestSubprocessCrashRecovery(t *testing.T) {
 	if dir := os.Getenv(crashEnvDir); dir != "" {
 		runCrashChild(dir, os.Getenv(crashEnvPhase))

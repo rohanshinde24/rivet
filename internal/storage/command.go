@@ -33,7 +33,7 @@ const commandSchemaVersion uint8 = 1
 // schema version, operation kind, client ID, request sequence, and key length.
 const commandFixedBytes = 1 + 1 + 16 + 8 + 4
 
-// ClientID identifies a write session. It must be nonzero (ADR-0006).
+// ClientID identifies a write session. It must be nonzero.
 type ClientID [16]byte
 
 // IsZero reports whether the identifier is the reserved all-zero value.
@@ -54,7 +54,7 @@ type RequestIdentity struct {
 }
 
 // command is the deterministic durable form of a write. It holds no deadline,
-// clock reading, trace identifier, address, or response text (ADR-0007).
+// clock reading, trace identifier, address, or response text.
 type command struct {
 	Kind     OpKind
 	ClientID ClientID
@@ -75,8 +75,7 @@ func (c *command) encodedLen() int {
 // encode appends the canonical payload encoding of c to dst.
 //
 // The encoding is deterministic: the same command always produces identical
-// bytes, which is what makes replay and snapshot digests comparable
-// (INV-003-5).
+// bytes, which is what makes replay and snapshot digests comparable.
 func (c *command) encode(dst []byte) []byte {
 	var scratch [8]byte
 
@@ -98,7 +97,7 @@ func (c *command) encode(dst []byte) []byte {
 // decodeCommand decodes a payload produced by encode. It copies key and value
 // out of buf so the caller may reuse buf, and rejects any length that is
 // inconsistent with the payload or with the configured limits before
-// allocating (INV-003-4, INV-003-11).
+// allocating.
 func decodeCommand(buf []byte, maxKey, maxValue int) (*command, error) {
 	const op = "decodeCommand"
 
@@ -165,7 +164,7 @@ const digestDomain = "rivet.storage.command.v1\x00"
 // digest is the canonical content digest of a command: operation kind, key,
 // and value. It deliberately excludes client ID and sequence, because its
 // purpose is to decide whether a retry of the same sequence carries the same
-// content (ADR-0006).
+// content.
 func (c *command) digest() [32]byte {
 	var scratch [8]byte
 	h := sha256.New()

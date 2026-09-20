@@ -38,7 +38,7 @@ const (
 )
 
 // stateMachine is the deterministic KV and session state. It is owned
-// exclusively by the engine event loop (ADR-0005); nothing else mutates it.
+// exclusively by the engine event loop; nothing else mutates it.
 type stateMachine struct {
 	kv       map[string][]byte
 	sessions map[ClientID]sessionEntry
@@ -53,7 +53,7 @@ func newStateMachine() *stateMachine {
 }
 
 // get returns a copy of the value for key. The copy is what keeps a caller
-// from aliasing engine-owned bytes (ADR-0007).
+// from aliasing engine-owned bytes.
 func (s *stateMachine) get(key []byte) ([]byte, bool) {
 	v, ok := s.kv[string(key)]
 	if !ok {
@@ -107,11 +107,11 @@ func (s *stateMachine) admit(c *command, maxSessions int) (admission, writeResul
 
 // apply executes a durable command at globalSeq. It is the single place where
 // KV and session state change, and it behaves identically on the live path and
-// during replay (INV-003-5).
+// during replay.
 //
 // Every precondition failure here is an invariant violation rather than a
 // rejected request: on the live path admit has already passed, and during
-// replay the command was durable and must be applicable (INV-003-9).
+// replay the command was durable and must be applicable.
 func (s *stateMachine) apply(c *command, globalSeq uint64, maxKeys int) (writeResult, error) {
 	const op = "apply"
 
@@ -165,7 +165,7 @@ func (s *stateMachine) apply(c *command, globalSeq uint64, maxKeys int) (writeRe
 }
 
 // clone returns a deep, immutable-by-convention copy for a snapshot worker.
-// The worker never touches live state (ADR-0004, ADR-0005).
+// The worker never touches live state.
 func (s *stateMachine) clone() *stateMachine {
 	out := &stateMachine{
 		kv:       make(map[string][]byte, len(s.kv)),
@@ -209,8 +209,8 @@ func (s *stateMachine) sortedClients() []ClientID {
 }
 
 // digest is a deterministic fingerprint of the entire logical state. Two
-// recoveries of the same durable bytes must produce the same value
-// (INV-003-5); tests compare it rather than walking maps.
+// recoveries of the same durable bytes must produce the same value; tests
+// compare it rather than walking maps.
 func (s *stateMachine) digest() [32]byte {
 	var scratch [8]byte
 	h := sha256.New()

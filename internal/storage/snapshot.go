@@ -239,13 +239,12 @@ func decodeSnapshot(buf []byte, cfg Config) (*stateMachine, error) {
 	return s, nil
 }
 
-// publishSnapshot performs steps 3 through 7 of the SPEC-003 publication
-// protocol: write a temporary file, synchronize it, validate it through the
-// normal decode path, rename it atomically, and synchronize the directory.
+// publishSnapshot writes a temporary file, synchronizes it, validates it
+// through the normal decode path, renames it atomically, and synchronizes the
+// parent directory.
 //
 // Compaction is deliberately not done here. Only the event loop may delete
-// segments, and only after this function has returned successfully
-// (ADR-0004, ADR-0005).
+// segments, and only after this function has returned successfully.
 func publishSnapshot(dir string, snap *stateMachine, cfg Config, hooks *ioHooks) (path string, ambiguous bool, err error) {
 	const op = "publishSnapshot"
 

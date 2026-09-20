@@ -11,7 +11,7 @@ import (
 const lockFileName = "LOCK"
 
 // dirLock is exclusive ownership of a data directory for the lifetime of an
-// engine (INV-003-10). The lock is advisory, and it is released by the
+// engine. The lock is advisory, and it is released by the
 // kernel if the process dies, which is what makes a crashed engine's
 // directory reopenable.
 type dirLock struct {

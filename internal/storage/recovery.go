@@ -24,13 +24,13 @@ type recoveryResult struct {
 	truncatedBytes   int64
 }
 
-// runRecovery executes the SPEC-003 recovery algorithm over dir.
+// runRecovery rebuilds engine state from the durable contents of dir.
 //
 // The whole function has one bias: it would rather refuse to open than open
-// onto a state it cannot prove is a contiguous prefix of acknowledged history
-// (INV-003-3). The single exception is a torn record at the physical end of
-// the newest active segment, which is the only damage a crash between write
-// and sync can legitimately produce (ADR-0002).
+// onto a state it cannot prove is a contiguous prefix of acknowledged
+// history. The single exception is a torn record at the physical end of the
+// newest active segment, which is the only damage a crash between write and
+// sync can legitimately produce.
 func runRecovery(dir string, cfg Config, hooks *ioHooks) (*recoveryResult, error) {
 	const op = "recovery"
 
@@ -73,7 +73,7 @@ func runRecovery(dir string, cfg Config, hooks *ioHooks) (*recoveryResult, error
 		}
 	}
 
-	// Step 3 and 4: the highest finalized snapshot is the only candidate. An
+	// The highest finalized snapshot is the only candidate. An
 	// older one cannot be silently substituted, because the WAL prefix it
 	// needs may already have been compacted away.
 	state := newStateMachine()
@@ -95,7 +95,7 @@ func runRecovery(dir string, cfg Config, hooks *ioHooks) (*recoveryResult, error
 			Count: int64(len(state.kv))})
 	}
 
-	// Step 5: segment set validation before a single record is decoded.
+	// The segment set is validated before a single record is decoded.
 	sort.Slice(segments, func(i, j int) bool { return segments[i].StartSeq < segments[j].StartSeq })
 	activeCount := 0
 	for i, seg := range segments {
@@ -136,7 +136,7 @@ func runRecovery(dir string, cfg Config, hooks *ioHooks) (*recoveryResult, error
 		nextSeq = segments[0].StartSeq
 	}
 
-	// Steps 6 to 9: decode and apply, one contiguous increasing prefix.
+	// Decode and apply one contiguous increasing prefix.
 	for i, seg := range segments {
 		isNewest := i == len(segments)-1
 		path := filepath.Join(dir, seg.Name)

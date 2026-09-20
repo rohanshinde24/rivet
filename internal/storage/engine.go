@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Lifecycle states (SPEC-003 "Engine lifecycle").
+// Lifecycle states.
 const (
 	stateRecovering uint32 = iota
 	stateServing
@@ -95,8 +95,7 @@ type snapshotOutcome struct {
 // Like ioHooks it is unexported and reachable only from this package's tests.
 type phaseHook func(phase string) error
 
-// Write-path phases at which tests may inject a failure. The names match the
-// failpoints listed in SPEC-003 "Crash/failpoint tests".
+// Write-path phases at which tests may inject a failure.
 const (
 	phaseBeforeAppend = "before_append"
 	phaseAfterWrite   = "after_write"
@@ -111,7 +110,7 @@ const (
 // directory.
 //
 // All KV state, session state, the global sequence, the WAL writer, and
-// lifecycle transitions are owned by one event loop goroutine (ADR-0005).
+// lifecycle transitions are owned by one event loop goroutine.
 // Exported methods only validate arguments, copy caller bytes, and hand a
 // request to that loop.
 type Engine struct {
@@ -202,7 +201,7 @@ func openEngine(cfg Config, hooks *ioHooks, phase phaseHook) (*Engine, error) {
 	e.sm = rec.state
 	e.snapshotSeq = rec.snapshotSequence
 
-	// Step 10: the active segment must be ready for appends, and durably
+	// The active segment must be ready for appends, and durably
 	// registered, before the engine serves anything.
 	if rec.activeName != "" {
 		e.wal, err = openSegmentForAppend(cfg.Dir, rec.activeName, rec.activeStart,
@@ -264,8 +263,8 @@ func (e *Engine) Stats() Stats {
 
 // Get returns a copy of the value for key.
 //
-// The read is ordered at the event loop between commands, which is the local
-// linearization point for P0.1. It appends nothing to the WAL.
+// The read is ordered at the event loop between commands, which is its
+// linearization point. It appends nothing to the WAL.
 func (e *Engine) Get(ctx context.Context, key []byte) (value []byte, found bool, appliedSeq uint64, err error) {
 	if err := e.validateKey("Get", key); err != nil {
 		return nil, false, 0, err
@@ -620,8 +619,8 @@ func (e *Engine) handleSnapshot(r *request) {
 		return
 	}
 
-	// Step 1 and 2 of the publication protocol run on the event loop, so the
-	// copy and the segment boundary describe exactly the same sequence.
+	// The barrier runs on the event loop, so the captured copy and the
+	// segment boundary describe exactly the same sequence.
 	if err := e.rotate(); err != nil {
 		e.fault("snapshot.rotate", err)
 		r.reply <- response{err: wrapError(CodeStorage, "CreateSnapshot",
@@ -652,7 +651,7 @@ func (e *Engine) completeSnapshot(out snapshotOutcome) {
 			Code: CodeOf(out.err), Err: out.err})
 		// A failure before publication leaves the active WAL path intact, so
 		// the engine keeps serving. A failure at or after the rename can leave
-		// the recovery path ambiguous, so it faults (SPEC-003 open question 4).
+		// the recovery path ambiguous, so it faults.
 		if out.ambiguous {
 			e.fault("snapshot.publish", out.err)
 		}
@@ -690,29 +689,40 @@ func (e *Engine) compact(through uint64) {
 		return
 	}
 
-	deleted := false
-	var snapshots []uint64
+	var (
+		doomed    []segmentName
+		snapshots []uint64
+	)
 	for _, entry := range entries {
 		name := entry.Name()
 		switch {
 		case hasSegmentPrefix(name):
 			seg, perr := parseSegmentName(name)
-			if perr != nil || !seg.Sealed || seg.EndSeq > through {
-				continue
+			if perr == nil && seg.Sealed && seg.EndSeq <= through {
+				doomed = append(doomed, seg)
 			}
-			if rerr := e.hooks.Remove(filepath.Join(e.cfg.Dir, name)); rerr != nil {
-				e.cfg.emit(Event{Name: EventStorageFailure, Segment: name,
-					Detail: "segment deletion", Err: rerr})
-				continue
-			}
-			deleted = true
-			e.cfg.emit(Event{Name: EventSegmentDeleted, Segment: name, Sequence: seg.EndSeq})
 		case hasSnapshotPrefix(name):
 			seq, final, perr := parseSnapshotName(name)
 			if perr == nil && final {
 				snapshots = append(snapshots, seq)
 			}
 		}
+	}
+
+	// Delete oldest first. Stopping partway then leaves a contiguous suffix
+	// of segments rather than a hole, so an interrupted compaction still
+	// presents a replayable chain on the next open.
+	sort.Slice(doomed, func(i, j int) bool { return doomed[i].EndSeq < doomed[j].EndSeq })
+
+	deleted := false
+	for _, seg := range doomed {
+		if rerr := e.hooks.Remove(filepath.Join(e.cfg.Dir, seg.Name)); rerr != nil {
+			e.cfg.emit(Event{Name: EventStorageFailure, Segment: seg.Name,
+				Detail: "segment deletion", Err: rerr})
+			break
+		}
+		deleted = true
+		e.cfg.emit(Event{Name: EventSegmentDeleted, Segment: seg.Name, Sequence: seg.EndSeq})
 	}
 
 	// Retain the newest snapshot and one prior; older ones are superseded.
@@ -738,7 +748,7 @@ func (e *Engine) compact(through uint64) {
 
 // fault moves the engine to Faulted. After this no operation is accepted, even
 // though memory may still look readable: serving it would hide a required
-// restart (INV-003-12).
+// restart.
 func (e *Engine) fault(op string, err error) {
 	e.storageFails.Add(1)
 	if e.state.CompareAndSwap(stateServing, stateFaulted) ||

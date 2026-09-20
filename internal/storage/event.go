@@ -2,8 +2,7 @@ package storage
 
 // Event is one structured engine event. Its fields are deliberately a fixed,
 // bounded set: no raw key or value bytes are ever carried, and a client is
-// identified only by a short diagnostic prefix of its ID
-// (SPEC-003 "Observability").
+// identified only by a short diagnostic prefix of its ID.
 type Event struct {
 	Name     string
 	Segment  string

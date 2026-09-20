@@ -7,7 +7,7 @@ import (
 
 // FuzzDecodeCommand asserts two properties over arbitrary bytes: the decoder
 // never panics, and anything it accepts re-encodes to exactly the input. The
-// second property is what keeps replay deterministic (INV-003-5).
+// second property is what keeps replay deterministic.
 func FuzzDecodeCommand(f *testing.F) {
 	cfg := testConfig()
 	f.Add((&command{Kind: OpPut, ClientID: clientID(1), Sequence: 1, Key: []byte("k"), Value: []byte("v")}).encode(nil))
@@ -78,7 +78,7 @@ func FuzzDecodeSnapshot(f *testing.F) {
 
 // FuzzRecoveryTruncation checks that no prefix of a valid segment ever yields
 // a partially applied command: recovery either rejects the file or applies a
-// contiguous prefix (INV-003-3, INV-003-4).
+// contiguous prefix.
 func FuzzRecoveryTruncation(f *testing.F) {
 	cfg := testConfig()
 

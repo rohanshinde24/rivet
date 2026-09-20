@@ -174,7 +174,7 @@ func TestFrameRoundTrip(t *testing.T) {
 }
 
 // Every truncation of a frame must report an incomplete frame rather than
-// decoding a partial record (INV-003-4).
+// decoding a partial record.
 func TestFrameTruncationIsIncomplete(t *testing.T) {
 	buf := encodeFrame(nil, 1, []byte("payload"))
 	max := testConfig().maxFramePayload()
@@ -350,13 +350,13 @@ func TestApplySemantics(t *testing.T) {
 		t.Fatalf("delete absent must report existed=false: %+v %v", res, err)
 	}
 
-	// Out-of-order application is an invariant violation (INV-003-9).
+	// Out-of-order application is an invariant violation.
 	if _, err := s.apply(&command{Kind: OpPut, ClientID: c1, Sequence: 5, Key: []byte("x")}, 99, DefaultMaxKeys); err == nil {
 		t.Fatal("applied a command at the wrong global sequence")
 	}
 }
 
-// Returned values must never alias engine-owned memory (ADR-0007).
+// Returned values must never alias engine-owned memory.
 func TestGetCopiesValue(t *testing.T) {
 	s := newStateMachine()
 	value := []byte("original")
@@ -377,7 +377,7 @@ func TestGetCopiesValue(t *testing.T) {
 	}
 }
 
-// TestSessionRules covers every branch of ADR-0006 (INV-003-8).
+// TestSessionRules covers every branch of the duplicate-write rules.
 func TestSessionRules(t *testing.T) {
 	s := newStateMachine()
 	c1 := clientID(1)
@@ -429,7 +429,7 @@ func TestSessionRules(t *testing.T) {
 }
 
 // A new client beyond capacity is rejected before execution; existing clients
-// keep working (INV-003-11).
+// keep working.
 func TestSessionCapacity(t *testing.T) {
 	s := newStateMachine()
 	const capacity = 3
