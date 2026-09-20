@@ -452,7 +452,7 @@ func BenchmarkRecovery(b *testing.B) {
 			if err := e.Close(ctx); err != nil {
 				b.Fatal(err)
 			}
-			b.ReportMetric(float64(walBytes(b, dir)), "wal-bytes")
+			bytesToReplay := walBytes(b, dir)
 
 			b.ResetTimer()
 			for b.Loop() {
@@ -468,7 +468,10 @@ func BenchmarkRecovery(b *testing.B) {
 				}
 			}
 			b.StopTimer()
+
+			// ResetTimer clears reported metrics, so both are reported here.
 			b.ReportMetric(float64(records), "records")
+			b.ReportMetric(float64(bytesToReplay), "wal-bytes")
 		})
 	}
 }
