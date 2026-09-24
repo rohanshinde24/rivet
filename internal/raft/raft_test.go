@@ -5,30 +5,51 @@ import (
 	"testing"
 )
 
-func newTestNode(t *testing.T, id NodeID, peers ...NodeID) *Node {
+// testPeer is a member plus the store a driver would write on its behalf.
+// The two travel together because completing a Ready cycle without writing
+// the batch is not a shortcut, it is a different protocol.
+type testPeer struct {
+	*Node
+	store *MemoryLog
+}
+
+func newTestNode(t *testing.T, id NodeID, peers ...NodeID) *testPeer {
 	t.Helper()
-	n, err := NewNode(Config{ID: id, Peers: peers, Seed: 1}, NewMemoryLog(), HardState{})
+	store := NewMemoryLog()
+	n, err := NewNode(Config{ID: id, Peers: peers, Seed: 1}, store, HardState{})
 	if err != nil {
 		t.Fatalf("NewNode: %v", err)
 	}
-	return n
+	return &testPeer{Node: n, store: store}
+}
+
+// drive performs the work in a batch in the order the contract requires, then
+// reports it done.
+func drive(t *testing.T, p *testPeer) Ready {
+	t.Helper()
+	r := p.Ready()
+	if len(r.Entries) > 0 {
+		if err := ApplyEntries(p.store, r.Entries); err != nil {
+			t.Fatalf("persisting staged entries: %v", err)
+		}
+	}
+	p.Advance(r)
+	return r
 }
 
 // step applies an event and completes the Ready cycle, which is what a driver
 // does. Tests that care about the cycle itself drive it by hand.
-func step(t *testing.T, n *Node, ev Event) Ready {
+func step(t *testing.T, p *testPeer, ev Event) Ready {
 	t.Helper()
-	if err := n.Step(ev); err != nil {
+	if err := p.Step(ev); err != nil {
 		t.Fatalf("step %v: %v", ev.Type, err)
 	}
-	r := n.Ready()
-	n.Advance(r)
-	return r
+	return drive(t, p)
 }
 
-func recv(t *testing.T, n *Node, m Message) Ready {
+func recv(t *testing.T, p *testPeer, m Message) Ready {
 	t.Helper()
-	return step(t, n, Event{Type: EventMessage, Message: m})
+	return step(t, p, Event{Type: EventMessage, Message: m})
 }
 
 func messagesOfType(r Ready, typ MessageType) []Message {
@@ -227,10 +248,11 @@ func TestVoteComparesLastTermBeforeLength(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			log := NewMemoryLogWith(voterLog.ents[1:]...)
-			n, err := NewNode(Config{ID: 1, Peers: []NodeID{1, 2, 3}}, log, HardState{})
+			node, err := NewNode(Config{ID: 1, Peers: []NodeID{1, 2, 3}}, log, HardState{})
 			if err != nil {
 				t.Fatal(err)
 			}
+			n := &testPeer{Node: node, store: log}
 			r := recv(t, n, Message{
 				Type: MsgRequestVote, From: 2, To: 1, Term: 5,
 				LastLogIndex: tc.lastIndex, LastLogTerm: tc.lastTerm,
@@ -245,7 +267,7 @@ func TestVoteComparesLastTermBeforeLength(t *testing.T) {
 
 // --- leadership maintenance ---------------------------------------------
 
-func electLeader(t *testing.T, n *Node) {
+func electLeader(t *testing.T, n *testPeer) {
 	t.Helper()
 	step(t, n, Event{Type: EventCampaign})
 	recv(t, n, Message{Type: MsgRequestVoteResp, From: 2, To: 1, Term: n.Status().Term})
@@ -353,8 +375,13 @@ func TestProposalRequiresLeadership(t *testing.T) {
 	n.Advance(n.Ready())
 
 	electLeader(t, n)
-	if err := n.Step(Event{Type: EventPropose, Data: []byte("x")}); !errors.Is(err, ErrReplicationPending) {
-		t.Fatalf("propose to a leader = %v, want ErrReplicationPending", err)
+	before := n.Status().LastIndex
+	r := step(t, n, Event{Type: EventPropose, Data: []byte("x")})
+	if n.Status().LastIndex != before+1 {
+		t.Fatalf("proposal did not extend the log: %d then %d", before, n.Status().LastIndex)
+	}
+	if len(r.Entries) == 0 {
+		t.Fatal("a proposal must be staged for the driver to persist")
 	}
 }
 

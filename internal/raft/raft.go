@@ -3,6 +3,7 @@ package raft
 import (
 	"errors"
 	"math/rand"
+	"sort"
 )
 
 var (
@@ -13,11 +14,24 @@ var (
 	// performing the work it was already handed. Allowing that would let a
 	// message be sent describing state the driver has not yet made durable.
 	ErrReadyOutstanding = errors.New("raft: a Ready batch is outstanding; call Advance first")
-
-	// ErrReplicationPending marks a path that arrives with log replication.
-	// A leader can be elected and can hold leadership without it.
-	ErrReplicationPending = errors.New("raft: log replication is not implemented yet")
 )
+
+// progress is a leader's view of one member's log.
+type progress struct {
+	// Next is the index of the next entry to send.
+	Next Index
+
+	// Match is the highest index known to be held by that member. It only
+	// ever moves forward, because a stale response must not retract what a
+	// later one already confirmed.
+	Match Index
+
+	// inflight marks an unanswered append. Exactly one may be outstanding per
+	// peer: pipelining is not part of this milestone, and one at a time keeps
+	// flow control simple enough to reason about without measurement. A
+	// heartbeat clears it, so a lost response cannot wedge a peer.
+	inflight bool
+}
 
 // Status is a read-only view of a member, for tests and observability.
 type Status struct {
@@ -36,7 +50,7 @@ type Status struct {
 // runs to completion without blocking, touching a clock, or performing I/O.
 type Node struct {
 	cfg Config
-	log LogStore
+	log *raftLog
 	rng *rand.Rand
 
 	// Durable once the driver has written the HardState in a Ready batch.
@@ -46,7 +60,6 @@ type Node struct {
 	// Rebuilt on restart rather than persisted.
 	role   Role
 	leader NodeID
-	commit Index
 
 	electionElapsed  int
 	heartbeatElapsed int
@@ -55,6 +68,9 @@ type Node struct {
 	// votes records responses to this member's own candidacy, true for a
 	// grant. It is discarded whenever the term changes.
 	votes map[NodeID]bool
+
+	// progress is the leader's view of every member, nil otherwise.
+	progress map[NodeID]*progress
 
 	// Staged output, drained by Ready and cleared by Advance.
 	msgs       []Message
@@ -77,7 +93,7 @@ func NewNode(cfg Config, log LogStore, hs HardState) (*Node, error) {
 
 	n := &Node{
 		cfg:    cfg,
-		log:    log,
+		log:    newRaftLog(log),
 		rng:    rand.New(rand.NewSource(cfg.Seed)),
 		term:   hs.Term,
 		vote:   hs.Vote,
@@ -96,8 +112,8 @@ func (n *Node) Status() Status {
 		Vote:      n.vote,
 		Role:      n.role,
 		Leader:    n.leader,
-		Commit:    n.commit,
-		LastIndex: n.log.LastIndex(),
+		Commit:    n.log.committed,
+		LastIndex: n.log.lastIndex(),
 	}
 }
 
@@ -134,10 +150,7 @@ func (n *Node) step(ev Event) error {
 		n.campaign()
 		return nil
 	case EventPropose:
-		if n.role != Leader {
-			return ErrNotLeader
-		}
-		return ErrReplicationPending
+		return n.propose(ev.Data)
 	case EventMessage:
 		n.handleMessage(ev.Message)
 		return nil
@@ -158,7 +171,11 @@ func (n *Node) Ready() Ready {
 		sc := StateChange{Role: n.role, Term: n.term, Leader: n.leader}
 		r.StateChange = &sc
 	}
+	if staged := n.log.unstable; len(staged) > 0 {
+		r.Entries = append([]Entry(nil), staged...)
+	}
 	r.Messages = n.msgs
+	r.CommittedEntries = n.log.nextCommitted(n.cfg.MaxBytesPerMsg)
 
 	if !r.IsEmpty() {
 		n.readyOutstanding = true
@@ -170,7 +187,13 @@ func (n *Node) Ready() Ready {
 // that order. The batch is accepted as an argument because it becomes
 // meaningful once entries flow: the core then learns which of them reached
 // the log store.
-func (n *Node) Advance(Ready) {
+func (n *Node) Advance(r Ready) {
+	if k := len(r.Entries); k > 0 {
+		n.log.stableTo(r.Entries[k-1].Index)
+	}
+	if k := len(r.CommittedEntries); k > 0 {
+		n.log.appliedTo(r.CommittedEntries[k-1].Index)
+	}
 	n.hardDirty = false
 	n.stateDirty = false
 	n.msgs = nil
@@ -184,7 +207,14 @@ func (n *Node) tick() {
 		n.heartbeatElapsed++
 		if n.heartbeatElapsed >= n.cfg.HeartbeatTicks {
 			n.heartbeatElapsed = 0
-			n.broadcastHeartbeat()
+			// Clearing the outstanding flag makes the heartbeat double as a
+			// retry, so a lost response cannot silence a peer indefinitely.
+			for _, peer := range n.cfg.Peers {
+				if peer != n.cfg.ID {
+					n.progress[peer].inflight = false
+				}
+			}
+			n.broadcastAppend(true)
 		}
 		return
 	}
@@ -206,6 +236,7 @@ func (n *Node) resetElectionTimer() {
 // --- role transitions ---------------------------------------------------
 
 func (n *Node) becomeFollower(term Term, leader NodeID) {
+	n.progress = nil
 	if term != n.term {
 		// A new term carries no vote. Keeping one would let a member vote
 		// twice across terms on the strength of a stale record.
@@ -223,6 +254,7 @@ func (n *Node) becomeCandidate() {
 	n.vote = n.cfg.ID
 	n.role = Candidate
 	n.leader = None
+	n.progress = nil
 	n.votes = map[NodeID]bool{n.cfg.ID: true}
 	n.resetElectionTimer()
 }
@@ -233,9 +265,26 @@ func (n *Node) becomeLeader() {
 	n.votes = nil
 	n.heartbeatElapsed = 0
 
+	last := n.log.lastIndex()
+	n.progress = make(map[NodeID]*progress, len(n.cfg.Peers))
+	for _, peer := range n.cfg.Peers {
+		n.progress[peer] = &progress{Next: last + 1}
+	}
+
+	// A new leader appends one empty entry in its own term.
+	//
+	// Without it a leader that inherited only entries from earlier terms
+	// could never commit them: the commit rule refuses to count replicas of
+	// an earlier term's entry on their own, so the log would sit
+	// committed-short until an unrelated proposal happened to arrive.
+	n.log.append(Entry{Term: n.term, Index: last + 1})
+	self := n.progress[n.cfg.ID]
+	self.Match = n.log.lastIndex()
+	self.Next = self.Match + 1
+
 	// Assert leadership immediately rather than waiting a tick, so that other
 	// members stop counting down toward an election they would lose.
-	n.broadcastHeartbeat()
+	n.broadcastAppend(true)
 }
 
 func (n *Node) campaign() {
@@ -247,8 +296,8 @@ func (n *Node) campaign() {
 		return
 	}
 
-	lastIndex := n.log.LastIndex()
-	lastTerm, _ := n.log.Term(lastIndex)
+	lastIndex := n.log.lastIndex()
+	lastTerm := n.log.lastTerm()
 	for _, peer := range n.cfg.Peers {
 		if peer == n.cfg.ID {
 			continue
@@ -262,21 +311,117 @@ func (n *Node) campaign() {
 	}
 }
 
-func (n *Node) broadcastHeartbeat() {
-	prevIndex := n.log.LastIndex()
-	prevTerm, _ := n.log.Term(prevIndex)
+// propose appends a command to the leader's own log and starts replicating it.
+func (n *Node) propose(data []byte) error {
+	if n.role != Leader {
+		return ErrNotLeader
+	}
+
+	e := Entry{Term: n.term, Index: n.log.lastIndex() + 1, Data: append([]byte(nil), data...)}
+	n.log.append(e)
+
+	self := n.progress[n.cfg.ID]
+	self.Match = e.Index
+	self.Next = e.Index + 1
+
+	// A lone member is its own quorum, so its proposal is committed here.
+	n.maybeAdvanceCommit()
+	n.broadcastAppend(false)
+	return nil
+}
+
+// broadcastAppend offers every peer whatever it is missing. When force is
+// set an empty append is sent to a peer that needs nothing, which is what
+// keeps a quiet leader from being deposed.
+func (n *Node) broadcastAppend(force bool) {
 	for _, peer := range n.cfg.Peers {
 		if peer == n.cfg.ID {
 			continue
 		}
-		n.send(Message{
-			Type:         MsgAppend,
-			To:           peer,
-			PrevLogIndex: prevIndex,
-			PrevLogTerm:  prevTerm,
-			LeaderCommit: n.commit,
-		})
+		n.maybeSendAppend(peer, force)
 	}
+}
+
+func (n *Node) maybeSendAppend(to NodeID, force bool) {
+	pr := n.progress[to]
+	if pr == nil || (pr.inflight && !force) {
+		return
+	}
+
+	prevIndex := pr.Next - 1
+	prevTerm, err := n.log.term(prevIndex)
+	if err != nil {
+		// The entry this member needs is no longer held. Catching it up needs
+		// a snapshot, which arrives with the replicated shard.
+		return
+	}
+
+	ents, err := n.log.entries(pr.Next, n.log.lastIndex()+1, n.cfg.MaxBytesPerMsg)
+	if err != nil {
+		ents = nil
+	}
+	if len(ents) > n.cfg.MaxEntriesPerMsg {
+		ents = ents[:n.cfg.MaxEntriesPerMsg]
+	}
+	if len(ents) == 0 && !force {
+		return
+	}
+
+	n.send(Message{
+		Type:         MsgAppend,
+		To:           to,
+		PrevLogIndex: prevIndex,
+		PrevLogTerm:  prevTerm,
+		Entries:      ents,
+		LeaderCommit: n.log.committed,
+	})
+	pr.inflight = true
+}
+
+// maybeAdvanceCommit moves the commit index to the highest position a quorum
+// holds, but only when that position carries an entry from the current term.
+//
+// Counting replicas of an earlier term's entry is the classic way to commit
+// something that a later leader can still overwrite, so the term check is not
+// an optimization and cannot be relaxed.
+func (n *Node) maybeAdvanceCommit() bool {
+	matches := make([]Index, 0, len(n.cfg.Peers))
+	for _, peer := range n.cfg.Peers {
+		if peer == n.cfg.ID {
+			matches = append(matches, n.log.lastIndex())
+			continue
+		}
+		matches = append(matches, n.progress[peer].Match)
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i] > matches[j] })
+
+	candidate := matches[n.cfg.quorum()-1]
+	if candidate <= n.log.committed {
+		return false
+	}
+	if t, err := n.log.term(candidate); err == nil && t == n.term {
+		n.log.commitTo(candidate)
+		return true
+	}
+	return false
+}
+
+// lastIndexOfTerm finds this member's last entry in a given term, which lets
+// a leader skip a whole conflicting term in one round trip.
+func (n *Node) lastIndexOfTerm(t Term) (Index, bool) {
+	for i := n.log.lastIndex(); i > 0; i-- {
+		term, err := n.log.term(i)
+		if err != nil {
+			return 0, false
+		}
+		switch {
+		case term == t:
+			return i, true
+		case term < t:
+			return 0, false
+		}
+	}
+	return 0, false
 }
 
 func (n *Node) send(m Message) {
@@ -318,7 +463,7 @@ func (n *Node) handleMessage(m Message) {
 	case MsgAppend:
 		n.handleAppend(m)
 	case MsgAppendResp:
-		// The leader's use of this arrives with replication.
+		n.handleAppendResp(m)
 	}
 }
 
@@ -342,8 +487,8 @@ func (n *Node) handleVoteRequest(m Message) {
 // longer log does not win against a log that has seen a later term, which is
 // what keeps a committed entry from being lost to a stale but lengthy peer.
 func (n *Node) candidateIsUpToDate(m Message) bool {
-	lastIndex := n.log.LastIndex()
-	lastTerm, _ := n.log.Term(lastIndex)
+	lastIndex := n.log.lastIndex()
+	lastTerm := n.log.lastTerm()
 
 	if m.LastLogTerm != lastTerm {
 		return m.LastLogTerm > lastTerm
@@ -383,23 +528,95 @@ func (n *Node) handleAppend(m Message) {
 	// candidate that has not yet lost.
 	n.becomeFollower(m.Term, m.From)
 
-	prevTerm, err := n.log.Term(m.PrevLogIndex)
+	prevTerm, err := n.log.term(m.PrevLogIndex)
 	if err != nil || prevTerm != m.PrevLogTerm {
-		// The hint tells the leader where this member's log actually ends, so
-		// it can back up by more than one index per round trip. The leader's
-		// use of it arrives with replication.
+		hint, hintTerm := n.conflictHint(m.PrevLogIndex, prevTerm, err)
 		n.send(Message{
 			Type:       MsgAppendResp,
 			To:         m.From,
 			Reject:     true,
-			RejectHint: n.log.LastIndex() + 1,
+			RejectHint: hint,
+			RejectTerm: hintTerm,
 		})
 		return
+	}
+
+	n.log.truncateAndAppend(m.Entries)
+
+	lastNew := m.PrevLogIndex + Index(len(m.Entries))
+	if m.LeaderCommit > n.log.committed {
+		// A follower may only commit as far as it can actually see. Trusting
+		// the leader's index past its own log would report entries applied
+		// that it does not hold.
+		n.log.commitTo(min(m.LeaderCommit, lastNew))
 	}
 
 	n.send(Message{
 		Type:       MsgAppendResp,
 		To:         m.From,
-		MatchIndex: m.PrevLogIndex + Index(len(m.Entries)),
+		MatchIndex: lastNew,
 	})
+}
+
+// conflictHint tells the leader where to resume after a rejected append.
+//
+// Reporting the first index of the conflicting term rather than one index
+// back is what lets a follower that is a whole term behind be caught up in
+// one round trip instead of one per entry.
+func (n *Node) conflictHint(prevIndex Index, prevTerm Term, lookupErr error) (Index, Term) {
+	if lookupErr != nil {
+		return n.log.lastIndex() + 1, 0
+	}
+	first := prevIndex
+	for first > 1 {
+		t, err := n.log.term(first - 1)
+		if err != nil || t != prevTerm {
+			break
+		}
+		first--
+	}
+	return first, prevTerm
+}
+
+func (n *Node) handleAppendResp(m Message) {
+	if n.role != Leader {
+		return
+	}
+	pr := n.progress[m.From]
+	if pr == nil {
+		return
+	}
+	pr.inflight = false
+
+	if m.Reject {
+		next := m.RejectHint
+		if m.RejectTerm > 0 {
+			if idx, ok := n.lastIndexOfTerm(m.RejectTerm); ok {
+				next = idx + 1
+			}
+		}
+		if next < 1 {
+			next = 1
+		}
+		// Only ever back up. A reordered rejection must not undo progress a
+		// later acceptance already established.
+		if next < pr.Next {
+			pr.Next = next
+		}
+		n.maybeSendAppend(m.From, true)
+		return
+	}
+
+	if m.MatchIndex > pr.Match {
+		pr.Match = m.MatchIndex
+		pr.Next = pr.Match + 1
+		if n.maybeAdvanceCommit() {
+			// Tell everyone at once. A follower otherwise learns of a commit
+			// only on the next heartbeat, which delays application by a tick
+			// for no reason.
+			n.broadcastAppend(true)
+			return
+		}
+	}
+	n.maybeSendAppend(m.From, false)
 }
