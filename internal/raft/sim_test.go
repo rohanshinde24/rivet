@@ -45,7 +45,7 @@ type inflight struct {
 }
 
 type sim struct {
-	t    *testing.T
+	t    testing.TB
 	seed int64
 	rng  *rand.Rand
 
@@ -82,6 +82,43 @@ type sim struct {
 	// capture turns a violation into a recoverable panic instead of a test
 	// failure, for the tests that provoke violations on purpose.
 	capture bool
+
+	// crashAt stops a member partway through a batch, so a crash can be
+	// placed exactly at a durability boundary rather than between them.
+	crashAt func(id NodeID, p persistPoint) bool
+
+	// votedInTerm is every vote a member has told anyone about. A member that
+	// granted a vote and then, after restarting, granted a different one in
+	// the same term would have broken a promise someone already acted on.
+	votedInTerm map[NodeID]map[Term]NodeID
+}
+
+// persistPoint names a boundary inside a Ready batch.
+type persistPoint int
+
+const (
+	pointBeforeHardState persistPoint = iota
+	pointAfterHardState
+	pointAfterEntries
+	pointBeforeSend
+	pointAfterSend
+)
+
+func (p persistPoint) String() string {
+	switch p {
+	case pointBeforeHardState:
+		return "before persisting term and vote"
+	case pointAfterHardState:
+		return "after persisting term and vote"
+	case pointAfterEntries:
+		return "after persisting entries"
+	case pointBeforeSend:
+		return "before sending"
+	case pointAfterSend:
+		return "after sending"
+	default:
+		return "unknown"
+	}
 }
 
 // simViolation unwinds a check that has found a violation.
@@ -92,22 +129,23 @@ type sim struct {
 // is how it first crashed rather than reported.
 type simViolation struct{ msg string }
 
-func newSim(t *testing.T, seed int64, ids ...NodeID) *sim {
+func newSim(t testing.TB, seed int64, ids ...NodeID) *sim {
 	t.Helper()
 	s := &sim{
-		t:         t,
-		seed:      seed,
-		rng:       rand.New(rand.NewSource(seed)),
-		ids:       ids,
-		members:   map[NodeID]*simMember{},
-		partition: map[NodeID]int{},
-		blocked:   map[[2]NodeID]bool{},
-		leaders:   map[Term]NodeID{},
-		committed: map[Index]Entry{},
-		prevLog:   map[NodeID][]Entry{},
-		converged: map[NodeID]map[Index]bool{},
-		prevRole:  map[NodeID]Role{},
-		prevTerm:  map[NodeID]Term{},
+		t:           t,
+		seed:        seed,
+		rng:         rand.New(rand.NewSource(seed)),
+		ids:         ids,
+		members:     map[NodeID]*simMember{},
+		partition:   map[NodeID]int{},
+		blocked:     map[[2]NodeID]bool{},
+		leaders:     map[Term]NodeID{},
+		committed:   map[Index]Entry{},
+		prevLog:     map[NodeID][]Entry{},
+		converged:   map[NodeID]map[Index]bool{},
+		votedInTerm: map[NodeID]map[Term]NodeID{},
+		prevRole:    map[NodeID]Role{},
+		prevTerm:    map[NodeID]Term{},
 	}
 	for _, id := range ids {
 		store := NewMemoryLog()
@@ -185,9 +223,16 @@ func (s *sim) drive(m *simMember) {
 		return
 	}
 
+	if s.crashHere(m, pointBeforeHardState) {
+		return
+	}
+
 	// Persist first.
 	if r.HardState != nil {
 		m.hard = *r.HardState
+	}
+	if s.crashHere(m, pointAfterHardState) {
+		return
 	}
 	if len(r.Entries) > 0 {
 		if err := ApplyEntries(m.write, r.Entries); err != nil {
@@ -202,12 +247,22 @@ func (s *sim) drive(m *simMember) {
 		}
 	}
 
+	if s.crashHere(m, pointAfterEntries) {
+		return
+	}
+
 	// Only now may anything be sent, and only things the durable state
 	// supports. This is the assertion that the ordering contract exists for.
 	s.checkSendable(m, r)
 
+	if s.crashHere(m, pointBeforeSend) {
+		return
+	}
 	for _, msg := range r.Messages {
 		s.enqueue(msg)
+	}
+	if s.crashHere(m, pointAfterSend) {
+		return
 	}
 
 	for _, e := range r.CommittedEntries {
@@ -218,6 +273,18 @@ func (s *sim) drive(m *simMember) {
 
 // checkSendable verifies that no message in a batch claims something the
 // durable state does not support.
+// crashHere stops a member at a boundary if the test asked for it. A crash
+// mid-batch is the interesting one: everything already written survives and
+// everything else is gone, which is exactly what a real crash leaves.
+func (s *sim) crashHere(m *simMember, p persistPoint) bool {
+	if s.crashAt == nil || !s.crashAt(m.id, p) {
+		return false
+	}
+	s.logf("member %d crashed %s", m.id, p)
+	s.crash(m.id)
+	return true
+}
+
 func (s *sim) checkSendable(m *simMember, r Ready) {
 	for _, msg := range r.Messages {
 		if msg.Term != m.hard.Term {
@@ -230,6 +297,16 @@ func (s *sim) checkSendable(m *simMember, r Ready) {
 				s.fail("member %d granted a vote to %d while its durable vote is %d",
 					m.id, msg.To, m.hard.Vote)
 			}
+			byTerm := s.votedInTerm[m.id]
+			if byTerm == nil {
+				byTerm = map[Term]NodeID{}
+				s.votedInTerm[m.id] = byTerm
+			}
+			if prev, seen := byTerm[msg.Term]; seen && prev != msg.To {
+				s.fail("member %d granted term %d to %d after already granting it to %d",
+					m.id, msg.Term, msg.To, prev)
+			}
+			byTerm[msg.Term] = msg.To
 		case msg.Type == MsgAppendResp && !msg.Reject:
 			if msg.MatchIndex > m.store.LastIndex() {
 				s.fail("member %d claimed to hold index %d while its store ends at %d",

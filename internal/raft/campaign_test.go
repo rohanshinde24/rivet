@@ -444,3 +444,76 @@ func runRandomSchedule(t *testing.T, seed int64) {
 		s.fail("a proposal made after recovery never committed")
 	}
 }
+
+// R09: a crash at each durability boundary inside a batch.
+//
+// Between batches a crash is easy to survive. The interesting crashes are
+// inside one: after the term and vote are written but before the entries,
+// after the entries but before anything is sent, and after sending but before
+// applying. Each leaves a different mixture of written and lost state, and
+// none of them may let a member contradict something another member already
+// acted on.
+func TestR09CrashAtEveryDurabilityBoundary(t *testing.T) {
+	points := []persistPoint{
+		pointBeforeHardState,
+		pointAfterHardState,
+		pointAfterEntries,
+		pointBeforeSend,
+		pointAfterSend,
+	}
+
+	for _, point := range points {
+		t.Run(point.String(), func(t *testing.T) {
+			s := newSim(t, 900+int64(point), 1, 2, 3, 4, 5)
+
+			// Crash a handful of times at this boundary, then let the group
+			// settle. Crashing forever would only prove that a dead group
+			// makes no progress.
+			budget := 6
+			s.crashAt = func(id NodeID, p persistPoint) bool {
+				if p != point || budget == 0 {
+					return false
+				}
+				budget--
+				return true
+			}
+
+			proposals := 0
+			for step := 0; step < 200; step++ {
+				if step%7 == 0 {
+					if id, ok := s.leader(); ok {
+						s.proposeTo(id, fmt.Sprintf("v%d", proposals))
+						proposals++
+					}
+				}
+				if step%5 == 0 {
+					for _, id := range s.ids {
+						s.restart(id)
+					}
+				}
+				s.tick()
+			}
+
+			s.crashAt = nil
+			for _, id := range s.ids {
+				s.restart(id)
+			}
+			s.run(300)
+
+			if budget > 0 {
+				t.Skipf("the boundary %s was reached only %d times", point, 6-budget)
+			}
+			leader, ok := s.leader()
+			if !ok {
+				s.fail("no leader after crashing %s", point)
+			}
+
+			before := len(s.committed)
+			s.proposeTo(leader, "after-recovery")
+			s.run(200)
+			if len(s.committed) <= before {
+				s.fail("nothing committed after recovering from crashes %s", point)
+			}
+		})
+	}
+}

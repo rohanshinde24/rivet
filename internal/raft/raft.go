@@ -78,6 +78,8 @@ type Node struct {
 	stateDirty bool
 
 	readyOutstanding bool
+
+	counters counters
 }
 
 // NewNode creates a member from its durable state. A member that has never
@@ -92,13 +94,14 @@ func NewNode(cfg Config, log LogStore, hs HardState) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:    cfg,
-		log:    newRaftLog(log),
-		rng:    rand.New(rand.NewSource(cfg.Seed)),
-		term:   hs.Term,
-		vote:   hs.Vote,
-		role:   Follower,
-		leader: None,
+		cfg:      cfg,
+		log:      newRaftLog(log),
+		rng:      rand.New(rand.NewSource(cfg.Seed)),
+		term:     hs.Term,
+		vote:     hs.Vote,
+		role:     Follower,
+		leader:   None,
+		counters: newCounters(),
 	}
 	// Restored state is already durable, so it is not staged for writing.
 	n.resetElectionTimer()
@@ -235,9 +238,11 @@ func (n *Node) resetElectionTimer() {
 
 // --- role transitions ---------------------------------------------------
 
-func (n *Node) becomeFollower(term Term, leader NodeID) {
+func (n *Node) becomeFollower(term Term, leader NodeID, reason string) {
 	n.progress = nil
+	prevRole, prevLeader := n.role, n.leader
 	if term != n.term {
+		n.observe(Observation{Kind: ObsTermAdvanced, Term: term, Reason: reason})
 		// A new term carries no vote. Keeping one would let a member vote
 		// twice across terms on the strength of a stale record.
 		n.term = term
@@ -247,9 +252,13 @@ func (n *Node) becomeFollower(term Term, leader NodeID) {
 	n.leader = leader
 	n.votes = nil
 	n.resetElectionTimer()
+
+	if prevRole != Follower || prevLeader != leader {
+		n.observe(Observation{Kind: ObsRoleChange, Peer: leader, Reason: reason})
+	}
 }
 
-func (n *Node) becomeCandidate() {
+func (n *Node) becomeCandidate(reason string) {
 	n.term++
 	n.vote = n.cfg.ID
 	n.role = Candidate
@@ -257,6 +266,10 @@ func (n *Node) becomeCandidate() {
 	n.progress = nil
 	n.votes = map[NodeID]bool{n.cfg.ID: true}
 	n.resetElectionTimer()
+
+	n.counters.electionsStarted++
+	n.observe(Observation{Kind: ObsElectionStarted, Reason: reason})
+	n.observe(Observation{Kind: ObsRoleChange})
 }
 
 func (n *Node) becomeLeader() {
@@ -282,13 +295,25 @@ func (n *Node) becomeLeader() {
 	self.Match = n.log.lastIndex()
 	self.Next = self.Match + 1
 
+	n.counters.electionsWon++
+	n.counters.entriesAppended++
+	n.observe(Observation{Kind: ObsElectionWon, Index: last + 1})
+	n.observe(Observation{Kind: ObsRoleChange})
+	n.observe(Observation{Kind: ObsProgressReset, Index: last + 1})
+
 	// Assert leadership immediately rather than waiting a tick, so that other
 	// members stop counting down toward an election they would lose.
 	n.broadcastAppend(true)
 }
 
 func (n *Node) campaign() {
-	n.becomeCandidate()
+	// A campaign that starts before the timeout elapsed was forced, which is
+	// worth distinguishing in a trace from one the clock produced.
+	reason := ReasonTimeout
+	if n.electionElapsed < n.electionTimeout {
+		reason = ReasonForced
+	}
+	n.becomeCandidate(reason)
 
 	// A single-member group is its own quorum and wins without asking.
 	if n.cfg.quorum() == 1 {
@@ -319,6 +344,7 @@ func (n *Node) propose(data []byte) error {
 
 	e := Entry{Term: n.term, Index: n.log.lastIndex() + 1, Data: append([]byte(nil), data...)}
 	n.log.append(e)
+	n.counters.entriesAppended++
 
 	self := n.progress[n.cfg.ID]
 	self.Match = e.Index
@@ -401,6 +427,8 @@ func (n *Node) maybeAdvanceCommit() bool {
 	}
 	if t, err := n.log.term(candidate); err == nil && t == n.term {
 		n.log.commitTo(candidate)
+		n.counters.commitAdvances++
+		n.observe(Observation{Kind: ObsCommitAdvanced, Index: n.log.committed})
 		return true
 	}
 	return false
@@ -427,12 +455,15 @@ func (n *Node) lastIndexOfTerm(t Term) (Index, bool) {
 func (n *Node) send(m Message) {
 	m.From = n.cfg.ID
 	m.Term = n.term
+	n.counters.sent[m.Type]++
 	n.msgs = append(n.msgs, m)
 }
 
 // --- message handling ---------------------------------------------------
 
 func (n *Node) handleMessage(m Message) {
+	n.counters.received[m.Type]++
+
 	switch {
 	case m.Term > n.term:
 		// A higher term is handled before anything else the message says. An
@@ -441,13 +472,14 @@ func (n *Node) handleMessage(m Message) {
 		if m.Type == MsgAppend {
 			lead = m.From
 		}
-		n.becomeFollower(m.Term, lead)
+		n.becomeFollower(m.Term, lead, ReasonHigherTerm)
 
 	case m.Term < n.term:
 		// A stale request is answered so the sender learns the current term.
 		// A stale response is discarded: it describes a term that is over.
 		switch m.Type {
 		case MsgRequestVote:
+			n.observe(Observation{Kind: ObsVoteDenied, Peer: m.From, Reason: ReasonStaleTerm})
 			n.send(Message{Type: MsgRequestVoteResp, To: m.From, Reject: true})
 		case MsgAppend:
 			n.send(Message{Type: MsgAppendResp, To: m.From, Reject: true})
@@ -477,9 +509,16 @@ func (n *Node) handleVoteRequest(m Message) {
 		// Granting a vote means a leader may be forming, so the voter stops
 		// counting down toward its own candidacy.
 		n.resetElectionTimer()
+		n.observe(Observation{Kind: ObsVoteGranted, Peer: m.From})
 		n.send(Message{Type: MsgRequestVoteResp, To: m.From})
 		return
 	}
+
+	reason := ReasonLogBehind
+	if !canVote {
+		reason = ReasonAlreadyVoted
+	}
+	n.observe(Observation{Kind: ObsVoteDenied, Peer: m.From, Reason: reason})
 	n.send(Message{Type: MsgRequestVoteResp, To: m.From, Reject: true})
 }
 
@@ -519,18 +558,22 @@ func (n *Node) handleVoteResponse(m Message) {
 	case rejected >= n.cfg.quorum():
 		// This term cannot be won. Waiting out the timeout would work too,
 		// but stepping down now frees the member to vote in the next term.
-		n.becomeFollower(n.term, None)
+		n.counters.electionsLost++
+		n.observe(Observation{Kind: ObsElectionLost, Reason: ReasonQuorumRejected})
+		n.becomeFollower(n.term, None, ReasonQuorumRejected)
 	}
 }
 
 func (n *Node) handleAppend(m Message) {
 	// An append in the current term settles who leads it, including for a
 	// candidate that has not yet lost.
-	n.becomeFollower(m.Term, m.From)
+	n.becomeFollower(m.Term, m.From, ReasonLeaderAppend)
 
 	prevTerm, err := n.log.term(m.PrevLogIndex)
 	if err != nil || prevTerm != m.PrevLogTerm {
 		hint, hintTerm := n.conflictHint(m.PrevLogIndex, prevTerm, err)
+		n.counters.appendsRejected++
+		n.observe(Observation{Kind: ObsAppendRejected, Peer: m.From, Index: hint, Reason: ReasonLogMismatch})
 		n.send(Message{
 			Type:       MsgAppendResp,
 			To:         m.From,
@@ -541,14 +584,23 @@ func (n *Node) handleAppend(m Message) {
 		return
 	}
 
-	n.log.truncateAndAppend(m.Entries)
+	replacedFrom, appended := n.log.truncateAndAppend(m.Entries)
+	n.counters.entriesAppended += uint64(appended)
+	if replacedFrom > 0 {
+		n.observe(Observation{Kind: ObsLogTruncated, Peer: m.From, Index: replacedFrom})
+	}
 
 	lastNew := m.PrevLogIndex + Index(len(m.Entries))
 	if m.LeaderCommit > n.log.committed {
 		// A follower may only commit as far as it can actually see. Trusting
 		// the leader's index past its own log would report entries applied
 		// that it does not hold.
+		before := n.log.committed
 		n.log.commitTo(min(m.LeaderCommit, lastNew))
+		if n.log.committed > before {
+			n.counters.commitAdvances++
+			n.observe(Observation{Kind: ObsCommitAdvanced, Index: n.log.committed})
+		}
 	}
 
 	n.send(Message{

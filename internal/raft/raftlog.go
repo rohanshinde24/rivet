@@ -118,9 +118,11 @@ func (l *raftLog) append(ents ...Entry) {
 // A prefix that already matches is skipped rather than rewritten, because a
 // duplicated or retried append is ordinary traffic and must not disturb the
 // log. Only from the first genuine conflict is anything replaced.
-func (l *raftLog) truncateAndAppend(ents []Entry) {
+// It reports the index from which the log was replaced, or zero when the
+// entries were already present, so the caller can say so.
+func (l *raftLog) truncateAndAppend(ents []Entry) (replacedFrom Index, appended int) {
 	if len(ents) == 0 {
-		return
+		return 0, 0
 	}
 
 	i := 0
@@ -131,11 +133,17 @@ func (l *raftLog) truncateAndAppend(ents []Entry) {
 		}
 	}
 	if i == len(ents) {
-		return
+		return 0, 0
 	}
 
-	l.truncateFrom(ents[i].Index)
+	from := ents[i].Index
+	replaced := Index(0)
+	if from <= l.lastIndex() {
+		replaced = from
+	}
+	l.truncateFrom(from)
 	l.unstable = append(l.unstable, ents[i:]...)
+	return replaced, len(ents) - i
 }
 
 // truncateFrom drops staged entries at or after idx. Entries already in the

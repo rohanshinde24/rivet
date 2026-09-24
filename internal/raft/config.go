@@ -50,6 +50,11 @@ type Config struct {
 	// Seed drives every random choice the core makes, so that a schedule
 	// replays exactly. A core never reads a global or cryptographic source.
 	Seed int64
+
+	// OnObserve receives structured facts about this member's progress. It is
+	// called from inside a step, so it must not block or call back into the
+	// node. Nil disables observation entirely.
+	OnObserve func(Observation)
 }
 
 func (c Config) withDefaults() Config {

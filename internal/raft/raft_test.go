@@ -2,8 +2,33 @@ package raft
 
 import (
 	"errors"
+	"runtime"
 	"testing"
+	"time"
 )
+
+// settledGoroutines returns a goroutine count that has stopped moving, so a
+// straggler from an earlier test cannot hide a new one.
+func settledGoroutines(t testing.TB) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	last, stable := -1, 0
+	for {
+		runtime.Gosched()
+		got := runtime.NumGoroutine()
+		if got == last {
+			if stable++; stable >= 3 {
+				return got
+			}
+		} else {
+			last, stable = got, 0
+		}
+		if time.Now().After(deadline) {
+			return last
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
 
 // testPeer is a member plus the store a driver would write on its behalf.
 // The two travel together because completing a Ready cycle without writing
@@ -13,7 +38,7 @@ type testPeer struct {
 	store *MemoryLog
 }
 
-func newTestNode(t *testing.T, id NodeID, peers ...NodeID) *testPeer {
+func newTestNode(t testing.TB, id NodeID, peers ...NodeID) *testPeer {
 	t.Helper()
 	store := NewMemoryLog()
 	n, err := NewNode(Config{ID: id, Peers: peers, Seed: 1}, store, HardState{})
@@ -25,7 +50,7 @@ func newTestNode(t *testing.T, id NodeID, peers ...NodeID) *testPeer {
 
 // drive performs the work in a batch in the order the contract requires, then
 // reports it done.
-func drive(t *testing.T, p *testPeer) Ready {
+func drive(t testing.TB, p *testPeer) Ready {
 	t.Helper()
 	r := p.Ready()
 	if len(r.Entries) > 0 {
@@ -39,7 +64,7 @@ func drive(t *testing.T, p *testPeer) Ready {
 
 // step applies an event and completes the Ready cycle, which is what a driver
 // does. Tests that care about the cycle itself drive it by hand.
-func step(t *testing.T, p *testPeer, ev Event) Ready {
+func step(t testing.TB, p *testPeer, ev Event) Ready {
 	t.Helper()
 	if err := p.Step(ev); err != nil {
 		t.Fatalf("step %v: %v", ev.Type, err)
@@ -47,7 +72,7 @@ func step(t *testing.T, p *testPeer, ev Event) Ready {
 	return drive(t, p)
 }
 
-func recv(t *testing.T, p *testPeer, m Message) Ready {
+func recv(t testing.TB, p *testPeer, m Message) Ready {
 	t.Helper()
 	return step(t, p, Event{Type: EventMessage, Message: m})
 }
@@ -411,5 +436,73 @@ func TestElectionTimeoutIsSeeded(t *testing.T) {
 	}
 	if len(seen) < 2 {
 		t.Fatal("every seed produced the same timeout; the draw is not random")
+	}
+}
+
+// --- bounds -------------------------------------------------------------
+
+// An append must respect both the entry count and the byte budget, and must
+// still carry one entry when a single command exceeds the budget on its own.
+func TestAppendRespectsMessageLimits(t *testing.T) {
+	store := NewMemoryLog()
+	node, err := NewNode(Config{
+		ID: 1, Peers: []NodeID{1, 2, 3},
+		MaxEntriesPerMsg: 4,
+		MaxBytesPerMsg:   512,
+	}, store, HardState{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &testPeer{Node: node, store: store}
+
+	step(t, p, Event{Type: EventCampaign})
+	recv(t, p, Message{Type: MsgRequestVoteResp, From: 2, To: 1, Term: 1})
+
+	for i := 0; i < 20; i++ {
+		step(t, p, Event{Type: EventPropose, Data: []byte("small")})
+	}
+
+	// Force a peer all the way back so the next append has plenty to carry.
+	p.progress[2].Next = 1
+	p.progress[2].inflight = false
+	r := step(t, p, Event{Type: EventTick})
+
+	var sent *Message
+	for i := range r.Messages {
+		if r.Messages[i].To == 2 && r.Messages[i].Type == MsgAppend {
+			sent = &r.Messages[i]
+		}
+	}
+	if sent == nil {
+		t.Fatal("no append was sent to the lagging peer")
+	}
+	if len(sent.Entries) > 4 {
+		t.Fatalf("append carried %d entries, above the limit of 4", len(sent.Entries))
+	}
+	var bytes uint64
+	for _, e := range sent.Entries {
+		bytes += entrySize(e)
+	}
+	if len(sent.Entries) > 1 && bytes > 512 {
+		t.Fatalf("append carried %d bytes, above the budget of 512", bytes)
+	}
+}
+
+// The core must start nothing. A goroutine here would have no owner, no way
+// to be stopped, and no place in a value that is supposed to be steppable
+// from a single thread.
+func TestCoreStartsNoGoroutines(t *testing.T) {
+	baseline := settledGoroutines(t)
+
+	p := newTestNode(t, 1, 1, 2, 3)
+	step(t, p, Event{Type: EventCampaign})
+	recv(t, p, Message{Type: MsgRequestVoteResp, From: 2, To: 1, Term: 1})
+	for i := 0; i < 50; i++ {
+		step(t, p, Event{Type: EventPropose, Data: []byte("x")})
+		step(t, p, Event{Type: EventTick})
+	}
+
+	if got := settledGoroutines(t); got > baseline {
+		t.Fatalf("%d goroutines after stepping a core, baseline is %d", got, baseline)
 	}
 }

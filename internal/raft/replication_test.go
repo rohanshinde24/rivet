@@ -10,7 +10,7 @@ import (
 // reordering; those belong to the simulator, and this exists only so that
 // replication can be tested before the simulator does.
 type cluster struct {
-	t       *testing.T
+	t       testing.TB
 	ids     []NodeID
 	peers   map[NodeID]*testPeer
 	inbox   []Message
@@ -18,7 +18,7 @@ type cluster struct {
 	sent    int
 }
 
-func newCluster(t *testing.T, ids ...NodeID) *cluster {
+func newCluster(t testing.TB, ids ...NodeID) *cluster {
 	t.Helper()
 	c := &cluster{t: t, ids: ids, peers: map[NodeID]*testPeer{}, applied: map[NodeID][]Entry{}}
 	for _, id := range ids {
