@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sort"
@@ -21,9 +22,15 @@ import (
 
 // simMember is one member plus the durable state its driver keeps for it.
 type simMember struct {
-	id    NodeID
-	node  *Node
+	id   NodeID
+	node *Node
+
+	// store is the underlying log, read directly by the invariant checks.
 	store *MemoryLog
+
+	// write is what the member and its driver actually go through. It is the
+	// store unless a test has wrapped it to inject failures.
+	write LogStore
 
 	// hard is what the driver has actually written. A crash keeps this and
 	// the store, and discards everything else, which is the whole point.
@@ -54,15 +61,36 @@ type sim struct {
 	// partition maps a member to a group. Messages only flow within a group.
 	partition map[NodeID]int
 
+	// blocked cuts a single direction, which is how an asymmetric partition
+	// is expressed: a leader that can still send but never hears back.
+	blocked map[[2]NodeID]bool
+
+	// persistMayFail says a store failure is the point of the test rather
+	// than a bug in it. A member that cannot persist stops participating.
+	persistMayFail bool
+
 	// Invariant bookkeeping.
 	leaders   map[Term]NodeID
 	committed map[Index]Entry
 	prevLog   map[NodeID][]Entry
+	converged map[NodeID]map[Index]bool
 	prevRole  map[NodeID]Role
 	prevTerm  map[NodeID]Term
 
 	trace []string
+
+	// capture turns a violation into a recoverable panic instead of a test
+	// failure, for the tests that provoke violations on purpose.
+	capture bool
 }
+
+// simViolation unwinds a check that has found a violation.
+//
+// Every check is written assuming fail does not return, which is true of
+// t.Fatalf. A capture mode that merely recorded the message and returned
+// would let the check carry on reading state it has already rejected, which
+// is how it first crashed rather than reported.
+type simViolation struct{ msg string }
 
 func newSim(t *testing.T, seed int64, ids ...NodeID) *sim {
 	t.Helper()
@@ -73,14 +101,17 @@ func newSim(t *testing.T, seed int64, ids ...NodeID) *sim {
 		ids:       ids,
 		members:   map[NodeID]*simMember{},
 		partition: map[NodeID]int{},
+		blocked:   map[[2]NodeID]bool{},
 		leaders:   map[Term]NodeID{},
 		committed: map[Index]Entry{},
 		prevLog:   map[NodeID][]Entry{},
+		converged: map[NodeID]map[Index]bool{},
 		prevRole:  map[NodeID]Role{},
 		prevTerm:  map[NodeID]Term{},
 	}
 	for _, id := range ids {
-		s.members[id] = &simMember{id: id, store: NewMemoryLog()}
+		store := NewMemoryLog()
+		s.members[id] = &simMember{id: id, store: store, write: store}
 		s.start(id)
 	}
 	return s
@@ -97,6 +128,9 @@ func (s *sim) logf(format string, args ...any) {
 
 // fail reports a violation with everything needed to reproduce it.
 func (s *sim) fail(format string, args ...any) {
+	if s.capture {
+		panic(simViolation{msg: fmt.Sprintf(format, args...)})
+	}
 	tail := s.trace
 	if len(tail) > 60 {
 		tail = tail[len(tail)-60:]
@@ -113,7 +147,7 @@ func (s *sim) start(id NodeID) {
 		ID: id, Peers: s.ids,
 		// A distinct seed per member keeps them from campaigning in lockstep.
 		Seed: s.seed*1000 + int64(id),
-	}, m.store, m.hard)
+	}, m.write, m.hard)
 	if err != nil {
 		s.t.Fatalf("starting member %d: %v", id, err)
 	}
@@ -156,8 +190,15 @@ func (s *sim) drive(m *simMember) {
 		m.hard = *r.HardState
 	}
 	if len(r.Entries) > 0 {
-		if err := ApplyEntries(m.store, r.Entries); err != nil {
-			s.fail("member %d could not persist staged entries: %v", m.id, err)
+		if err := ApplyEntries(m.write, r.Entries); err != nil {
+			if !s.persistMayFail {
+				s.fail("member %d could not persist staged entries: %v", m.id, err)
+			}
+			// A member that cannot write its log cannot honestly answer for
+			// it, so it stops rather than replying on memory alone.
+			s.logf("member %d failed to persist and is stopping: %v", m.id, err)
+			s.crash(m.id)
+			return
 		}
 	}
 
@@ -198,9 +239,13 @@ func (s *sim) checkSendable(m *simMember, r Ready) {
 	}
 }
 
+func (s *sim) linkUp(from, to NodeID) bool {
+	return s.partition[from] == s.partition[to] && !s.blocked[[2]NodeID{from, to}]
+}
+
 func (s *sim) enqueue(msg Message) {
-	if s.partition[msg.From] != s.partition[msg.To] {
-		s.logf("dropped %s %d->%d: partitioned", msg.Type, msg.From, msg.To)
+	if !s.linkUp(msg.From, msg.To) {
+		s.logf("dropped %s %d->%d: link down", msg.Type, msg.From, msg.To)
 		return
 	}
 	if s.rng.Float64() < s.dropRate {
@@ -241,7 +286,7 @@ func (s *sim) deliverDue() {
 		if m == nil || m.down {
 			continue
 		}
-		if s.partition[f.msg.From] != s.partition[f.msg.To] {
+		if !s.linkUp(f.msg.From, f.msg.To) {
 			continue
 		}
 		s.stepMember(m, Event{Type: EventMessage, Message: f.msg})
@@ -311,17 +356,11 @@ func (s *sim) leader() (NodeID, bool) {
 	return None, false
 }
 
+// logEntries reads a member's stored entries without copying. Invariant
+// checks run after every tick of every schedule, so a copy here would cost
+// more than the protocol being tested. Callers must only read.
 func (s *sim) logEntries(id NodeID) []Entry {
-	m := s.members[id]
-	last := m.store.LastIndex()
-	if last == 0 {
-		return nil
-	}
-	ents, err := m.store.Entries(1, last+1, 1<<30)
-	if err != nil {
-		s.fail("reading log of %d: %v", id, err)
-	}
-	return ents
+	return s.members[id].store.all()
 }
 
 // --- invariants ---------------------------------------------------------
@@ -342,6 +381,46 @@ func (s *sim) checkInvariants() {
 	s.checkElectionSafety()
 	s.checkLeaderAppendOnly()
 	s.checkLogMatching()
+	s.checkCommittedNeverReplaced()
+}
+
+// Once a member holds the entry that was committed at an index, nothing may
+// ever replace it there.
+//
+// This is deliberately stronger than checking what members apply. An entry
+// wrongly committed and then overwritten by a later leader may never be
+// applied twice, so a checker that only watches applications can miss the
+// loss entirely. Watching the logs catches the overwrite itself.
+//
+// A member that has not yet converged on a committed index is not in
+// violation: a lagging minority legitimately holds a stale suffix until the
+// leader reaches it.
+func (s *sim) checkCommittedNeverReplaced() {
+	for _, id := range s.ids {
+		log := s.logEntries(id)
+		conv := s.converged[id]
+		if conv == nil {
+			conv = map[Index]bool{}
+			s.converged[id] = conv
+		}
+		for idx, want := range s.committed {
+			if int(idx) > len(log) {
+				if conv[idx] {
+					s.fail("member %d dropped committed index %d", id, idx)
+				}
+				continue
+			}
+			got := log[idx-1]
+			matches := got.Term == want.Term && bytes.Equal(got.Data, want.Data)
+			if conv[idx] && !matches {
+				s.fail("member %d replaced committed index %d: term %d %q became term %d %q",
+					id, idx, want.Term, want.Data, got.Term, got.Data)
+			}
+			if matches {
+				conv[idx] = true
+			}
+		}
+	}
 }
 
 // At most one leader may exist in a term.
@@ -408,7 +487,7 @@ func (s *sim) checkLeaderAppendOnly() {
 			}
 		}
 		s.prevRole[id], s.prevTerm[id] = st.Role, st.Term
-		s.prevLog[id] = log
+		s.prevLog[id] = append(s.prevLog[id][:0], log...)
 	}
 }
 
@@ -423,7 +502,7 @@ func (s *sim) checkLogMatching() {
 			la, lb := s.logEntries(a), s.logEntries(b)
 			prefixEqual := true
 			for i := 0; i < len(la) && i < len(lb); i++ {
-				same := la[i].Term == lb[i].Term && string(la[i].Data) == string(lb[i].Data)
+				same := la[i].Term == lb[i].Term && bytes.Equal(la[i].Data, lb[i].Data)
 				if la[i].Term == lb[i].Term {
 					if !same || !prefixEqual {
 						s.fail("members %d and %d share term %d at index %d but disagree before it",
@@ -589,4 +668,87 @@ func TestSimPartitionedMinorityCannotCommit(t *testing.T) {
 	if _, ok := s.leader(); !ok {
 		s.fail("no leader after the partition healed")
 	}
+}
+
+// --- checking the checkers ----------------------------------------------
+
+// A harness whose assertions cannot fail proves nothing, and these run after
+// every tick of every schedule, so a silent one would make the whole campaign
+// decorative. Each violation below is introduced deliberately.
+func TestSimCheckersDetectViolations(t *testing.T) {
+	violation := func(build func(*sim)) (msg string) {
+		s := newSim(t, 77, 1, 2, 3)
+		s.run(60)
+		if len(s.committed) == 0 {
+			t.Fatal("setup committed nothing to violate")
+		}
+
+		s.capture = true
+		defer func() {
+			r := recover()
+			if r == nil {
+				return
+			}
+			v, ok := r.(simViolation)
+			if !ok {
+				panic(r)
+			}
+			msg = v.msg
+		}()
+
+		build(s)
+		s.checkInvariants()
+		return ""
+	}
+
+	t.Run("committed entry replaced", func(t *testing.T) {
+		got := violation(func(s *sim) {
+			// Rewrite an entry that a member has already converged on.
+			for _, id := range s.ids {
+				m := s.members[id]
+				if m.store.LastIndex() >= 1 {
+					m.store.ents[1].Term = 99
+					m.store.ents[1].Data = []byte("forged")
+				}
+			}
+		})
+		if got == "" {
+			t.Fatal("rewriting a committed entry went unnoticed")
+		}
+		t.Logf("caught: %s", got)
+	})
+
+	t.Run("two leaders in one term", func(t *testing.T) {
+		got := violation(func(s *sim) {
+			for _, id := range s.ids {
+				m := s.members[id]
+				if m.down {
+					continue
+				}
+				m.node.role = Leader
+				m.node.term = 500
+			}
+		})
+		if got == "" {
+			t.Fatal("two leaders in one term went unnoticed")
+		}
+		t.Logf("caught: %s", got)
+	})
+
+	t.Run("leader rewrites its own log", func(t *testing.T) {
+		got := violation(func(s *sim) {
+			for _, id := range s.ids {
+				m := s.members[id]
+				if m.down || m.node.Status().Role != Leader {
+					continue
+				}
+				// Drop the tail of a leader's own log, which it may never do.
+				_ = m.store.TruncateSuffix(1)
+			}
+		})
+		if got == "" {
+			t.Fatal("a leader losing entries went unnoticed")
+		}
+		t.Logf("caught: %s", got)
+	})
 }

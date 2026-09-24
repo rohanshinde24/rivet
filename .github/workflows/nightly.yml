@@ -33,6 +33,27 @@ jobs:
       - name: Race detector, repeated
         run: go test -race ./... -count=3 -timeout 35m
 
+  campaign:
+    name: Randomized Raft schedules
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: false
+
+      # A fresh block of seeds every night, so coverage accumulates instead of
+      # re-running the same schedules. A failure prints the exact seed, which
+      # is all that is needed to replay it.
+      - name: Ten thousand schedules
+        env:
+          RIVET_RAFT_SEEDS: "10000"
+          RIVET_RAFT_BASE_SEED: ${{ github.run_number }}00000
+        run: go test ./internal/raft/ -run TestRandomizedSchedules -v -timeout 40m
+
   fuzz:
     name: Fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest

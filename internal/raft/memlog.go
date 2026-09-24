@@ -32,6 +32,10 @@ func NewMemoryLogWith(ents ...Entry) *MemoryLog {
 
 func (l *MemoryLog) offset() Index { return l.ents[0].Index }
 
+// all exposes the stored entries without copying, for in-package callers that
+// only read. The sentinel is not included.
+func (l *MemoryLog) all() []Entry { return l.ents[1:] }
+
 func (l *MemoryLog) FirstIndex() Index { return l.offset() + 1 }
 
 func (l *MemoryLog) LastIndex() Index { return l.ents[len(l.ents)-1].Index }

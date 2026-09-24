@@ -100,4 +100,7 @@ jobs:
           go-version-file: go.mod
           check-latest: true
           cache: false
-      - run: go test -race ./... -timeout 20m
+      # -short trims the randomized schedule campaign to a smoke run here.
+      # The race detector costs roughly an order of magnitude, and the full
+      # campaign belongs on the nightly job where there is time for it.
+      - run: go test -race -short ./... -timeout 20m
